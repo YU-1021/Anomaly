@@ -297,19 +297,22 @@ std::string Utf8(const std::filesystem::path& path) {
 constexpr std::uintmax_t kMaximumUiWindowStateFileBytes = 2U * 1024U * 1024U;
 constexpr std::size_t kMaximumUiPersistentWindows = 10000U;
 constexpr std::size_t kMaximumPersistentPluginWindows = 10000U;
+constexpr std::size_t kMaximumPersistentPluginFavorites = 10000U;
 constexpr std::size_t kMaximumPluginIdBytes = 255U;
 constexpr auto kUiWindowStateSaveInterval = std::chrono::milliseconds(500);
 
 struct PersistentUiState final {
     std::vector<anomaly::UiWindowPersistentState> windows;
     std::unordered_map<std::string, bool> plugin_windows;
+    std::unordered_set<std::string> favorites;
 };
 
 std::string SerializeUiWindowState(
     const std::vector<anomaly::UiWindowPersistentState>& windows,
-    const std::unordered_map<std::string, bool>& plugin_windows) {
+    const std::unordered_map<std::string, bool>& plugin_windows,
+    const std::unordered_set<std::string>& favorites) {
     nlohmann::json document{{"schemaVersion", 1}, {"windows", nlohmann::json::array()},
-        {"pluginWindows", nlohmann::json::array()}};
+        {"pluginWindows", nlohmann::json::array()}, {"favorites", nlohmann::json::array()}};
     for (const anomaly::UiWindowPersistentState& window : windows) {
         document["windows"].push_back({
             {"stableId", window.stable_id},
@@ -329,6 +332,11 @@ std::string SerializeUiWindowState(
         document["pluginWindows"].push_back({
             {"pluginId", plugin_id},
             {"visible", visible}});
+    }
+    std::vector<std::string> sorted_favorites(favorites.begin(), favorites.end());
+    std::ranges::sort(sorted_favorites);
+    for (const std::string& plugin_id : sorted_favorites) {
+        document["favorites"].push_back(plugin_id);
     }
     return document.dump(2) + '\n';
 }
@@ -378,6 +386,20 @@ PersistentUiState ParseUiWindowState(
         if (plugin_id.empty() || plugin_id.size() > kMaximumPluginIdBytes ||
             !result.plugin_windows.emplace(std::move(plugin_id), visible).second) {
             throw std::runtime_error("plugin window state value is invalid");
+        }
+    }
+    if (!document.contains("favorites")) return result;
+    const nlohmann::json& favorites = document["favorites"];
+    if (!favorites.is_array() || favorites.size() > kMaximumPersistentPluginFavorites) {
+        throw std::runtime_error("plugin favorites collection is invalid");
+    }
+    result.favorites.reserve(favorites.size());
+    for (const nlohmann::json& item : favorites) {
+        if (!item.is_string()) throw std::runtime_error("plugin favorite record is invalid");
+        std::string plugin_id = item.get<std::string>();
+        if (plugin_id.empty() || plugin_id.size() > kMaximumPluginIdBytes ||
+            !result.favorites.insert(std::move(plugin_id)).second) {
+            throw std::runtime_error("plugin favorite value is invalid");
         }
     }
     return result;
@@ -1366,6 +1388,7 @@ struct PluginServiceContext {
     AnomalyNotificationsServiceV1 notifications{};
     AnomalyNteEscMenuButtonServiceV1 nte_esc_menu_button{};
     AnomalySignatureServiceV1 signature{};
+    AnomalySignatureServiceV2 signature_v2{};
     AnomalyHookServiceV1 hook{};
     AnomalyPatchServiceV1 patch{};
     const AnomalyUiServiceV1* ui{};
@@ -2313,7 +2336,18 @@ AnomalyStatusV1 ANOMALY_CALL ResolveSignatureV1(
     return InvokeScopedPlatform(user, [&](PluginServiceContext& context) {
         return context.platform->ResolveSignature(
             ScopedPlatformOwner(context), ServiceString(module_name), ServiceString(section_name),
-            ServiceString(pattern), address);
+            ServiceString(pattern), address, !IsSynchronousStateIoForbidden());
+    });
+}
+
+AnomalyStatusV1 ANOMALY_CALL ResolveSignatureLayoutV2(
+    void* user, const AnomalySignatureLayoutRequestV2* request,
+    std::uintptr_t* addresses, const std::uint32_t address_count,
+    std::uint32_t* offsets, const std::uint32_t offset_count) {
+    return InvokeScopedPlatform(user, [&](PluginServiceContext& context) {
+        return context.platform->ResolveSignatureLayout(
+            ScopedPlatformOwner(context), request, addresses, address_count, offsets, offset_count,
+            !IsSynchronousStateIoForbidden());
     });
 }
 
@@ -3290,6 +3324,10 @@ AnomalyStatusV1 ANOMALY_CALL QueryServiceV1(
         *service = &context->nte_esc_menu_button;
         return StatusV1(ANOMALY_STATUS_V1_OK);
     }
+    if (id == ANOMALY_SIGNATURE_SERVICE_V2_ID && minimum_version == ANOMALY_SIGNATURE_SERVICE_V2_VERSION) {
+        *service = &context->signature_v2;
+        return StatusV1(ANOMALY_STATUS_V1_OK);
+    }
     if (id == ANOMALY_SIGNATURE_SERVICE_V1_ID &&
         minimum_version <= context->signature.service_version) {
         *service = &context->signature;
@@ -3497,6 +3535,10 @@ struct PluginManager::LoadedPlugin {
     bool faulted{};
     bool capability_audit_logged{};
     bool localization_catalog_loaded{};
+    // Reason the host last parked this generation in the waiting-for-service state. The
+    // periodic retry keeps hitting the same reason, so only a changed reason is logged again
+    // instead of writing one line every five seconds for the rest of the session.
+    std::string waiting_detail;
     PluginView view;
     std::filesystem::path shadow;
     anomaly::PluginShadowGeneration shadow_generation;
@@ -3649,9 +3691,7 @@ PluginManager::PluginManager(
     std::shared_ptr<anomaly::StructuredLogger> logger,
     anomaly::HotkeyDispatcher input_dispatcher,
     UiResourceWorkerDispatcher ui_resource_worker_dispatcher,
-    anomaly::IpcPost ipc_post,
-    PluginLoadPredicate load_predicate,
-    PluginActivationObserver activation_observer)
+    anomaly::IpcPost ipc_post)
     : root_(std::filesystem::absolute(root)),
       plugin_directory_(plugin_directory.is_absolute() ? std::move(plugin_directory)
                                                         : root_ / plugin_directory),
@@ -3667,8 +3707,6 @@ PluginManager::PluginManager(
        input_service_(std::move(input_dispatcher)),
        ui_resource_worker_dispatcher_(std::move(ui_resource_worker_dispatcher)),
        ui_resource_worker_gate_(std::make_shared<UiResourceWorkerGate>()),
-       load_predicate_(std::move(load_predicate)),
-       activation_observer_(std::move(activation_observer)),
        lifecycle_ledger_(std::make_shared<anomaly::ResourceLedger>()),
       platform_services_(std::make_unique<anomaly::ScopedPlatformServices>(
           memory_services_, lifecycle_ledger_)),
@@ -4082,31 +4120,8 @@ std::vector<PluginStopDiagnostic> PluginManager::StopDiagnostics() const {
     return stop_diagnostics_;
 }
 
-bool PluginManager::LoadAllowed(const anomaly::PluginCatalogEntry& entry) const {
-    return entry.manifest && (!load_predicate_ || load_predicate_(*entry.manifest));
-}
-
-void PluginManager::PublishSuspended(const anomaly::PluginCatalogEntry& entry) {
-    if (!entry.manifest) return;
-    PluginView view;
-    view.id = entry.manifest->id;
-    view.name = entry.manifest->name;
-    view.author = entry.manifest->author;
-    view.version = entry.manifest->version.ToString();
-    view.source = entry.entry_file;
-    view.package_directory = entry.package_root;
-    view.visible = false;
-    view.enabled = false;
-    view.state = "suspended";
-    view.status_reason = "suspended by Runtime recovery policy";
-    disabled_plugins_[view.id] = std::move(view);
-}
-
 bool PluginManager::LoadCatalogEntry(const anomaly::PluginCatalogEntry& entry) {
-    if (!LoadAllowed(entry)) {
-        PublishSuspended(entry);
-        return false;
-    }
+    if (!entry.manifest) return false;
     anomaly::PluginShadowResult staged;
     RunPluginLoadStep([&] { staged = shadow_store_.Stage(entry); });
     if (!staged.Ok()) {
@@ -4117,26 +4132,7 @@ bool PluginManager::LoadCatalogEntry(const anomaly::PluginCatalogEntry& entry) {
     const std::filesystem::path source = entry.entry_file;
     const std::filesystem::path binary = staged.shadow->entry_file;
     const std::filesystem::path package = entry.package_root;
-    const std::string plugin_id(staged.shadow->manifest.id);
-    const std::uint64_t generation = staged.shadow->generation;
-    const auto publish_activation = [&](bool entering) noexcept {
-        try {
-            if (activation_observer_) {
-                activation_observer_(plugin_id, generation, entering);
-            }
-        } catch (...) {
-        }
-    };
-    publish_activation(true);
-    try {
-        const bool loaded = LoadBinary(
-            source, binary, package, std::move(*staged.shadow));
-        publish_activation(false);
-        return loaded;
-    } catch (...) {
-        publish_activation(false);
-        throw;
-    }
+    return LoadBinary(source, binary, package, std::move(*staged.shadow));
 }
 
 bool PluginManager::Activate(LoadedPlugin& plugin) {
@@ -4258,6 +4254,9 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
     plugin.service_context.signature = {
         sizeof(AnomalySignatureServiceV1), ANOMALY_SIGNATURE_SERVICE_V1_VERSION,
         &plugin.service_context, ResolveSignatureV1};
+    plugin.service_context.signature_v2 = {
+        sizeof(AnomalySignatureServiceV2), ANOMALY_SIGNATURE_SERVICE_V2_VERSION,
+        &plugin.service_context, ResolveSignatureV1, ResolveSignatureLayoutV2};
     plugin.service_context.hook = {
         sizeof(AnomalyHookServiceV1), ANOMALY_HOOK_SERVICE_V1_VERSION,
         &plugin.service_context,
@@ -4326,7 +4325,12 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
         plugin.plugin_context = nullptr;
         plugin.waiting_for_service = true;
         plugin.started = false;
-        Log(ANOMALY_CORE_LOG_LEVEL_V1_INFO, "ABI v1 plugin waiting for service: " + plugin.view.id);
+        const std::string detail = StatusMessage("on_load", load_status);
+        if (plugin.waiting_detail != detail) {
+            plugin.waiting_detail = detail;
+            Log(ANOMALY_CORE_LOG_LEVEL_V1_INFO,
+                "ABI v1 plugin waiting for service: " + plugin.view.id);
+        }
         return true;
     }
     if (load_status.code != ANOMALY_STATUS_V1_OK) {
@@ -4362,8 +4366,12 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
             if (start_status.code == ANOMALY_STATUS_V1_UNAVAILABLE) {
                 plugin.waiting_for_service = true;
                 plugin.started = false;
-                Log(ANOMALY_CORE_LOG_LEVEL_V1_INFO,
-                    "ABI v1 plugin waiting for service: " + plugin.view.id);
+                const std::string detail = StatusMessage("on_start", start_status);
+                if (plugin.waiting_detail != detail) {
+                    plugin.waiting_detail = detail;
+                    Log(ANOMALY_CORE_LOG_LEVEL_V1_INFO,
+                        "ABI v1 plugin waiting for service: " + plugin.view.id);
+                }
                 return true;
             }
             plugin.waiting_for_service = false;
@@ -4374,6 +4382,7 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
         }
     }
     plugin.waiting_for_service = false;
+    plugin.waiting_detail.clear();
     plugin.started = true;
     ReconcileWindowVisibility(plugin);
     Log(ANOMALY_CORE_LOG_LEVEL_V1_INFO, "ABI v1 plugin started: " + plugin.view.id);
@@ -4602,10 +4611,6 @@ void PluginManager::LoadAll() {
     }
     for (const std::string& id : plan.load_order) {
         const anomaly::PluginCatalogEntry* entry = catalog.Find(id);
-        if (entry != nullptr && !LoadAllowed(*entry)) {
-            PublishSuspended(*entry);
-            continue;
-        }
         const auto decision = enablement.find(id);
         if (entry != nullptr && decision != enablement.end() && !decision->second.enabled) {
             disabled_view(*entry, "disabled", decision->second.reason);
@@ -4741,7 +4746,7 @@ bool PluginManager::ReconcileEnablement(
         const auto* entry = catalog.Find(plugin->view.id);
         if (decision != decisions.end() && decision->second.enabled &&
             node != nullptr && node->state == anomaly::PluginDependencyState::Ready &&
-            entry != nullptr && LoadAllowed(*entry)) {
+            entry != nullptr) {
             retained.insert(plugin->view.id);
         }
     }
@@ -4823,9 +4828,7 @@ bool PluginManager::ReconcileEnablement(
     for (const auto& [id, decision] : decisions) {
         const auto* entry = catalog.Find(id);
         if (entry == nullptr) continue;
-        if (!LoadAllowed(*entry)) {
-            PublishSuspended(*entry);
-        } else if (quarantined(id) || active(id)) {
+        if (quarantined(id) || active(id)) {
             disabled_plugins_.erase(id);
         } else if (decision.enabled) {
             disabled_plugins_.erase(id);
@@ -4839,10 +4842,6 @@ bool PluginManager::ReconcileEnablement(
         const auto decision = decisions.find(id);
         if (decision == decisions.end() || !decision->second.enabled || active(id)) continue;
         const anomaly::PluginCatalogEntry* entry = catalog.Find(id);
-        if (entry != nullptr && !LoadAllowed(*entry)) {
-            PublishSuspended(*entry);
-            continue;
-        }
         if (entry == nullptr || !entry->manifest || quarantined(id)) {
             loaded = false;
             continue;
@@ -5111,10 +5110,14 @@ void PluginManager::LoadPersistentUiWindowState() {
             throw std::runtime_error("UI window state values are invalid");
         }
         ui_window_state_last_document_ = SerializeUiWindowState(
-            state.windows, state.plugin_windows);
+            state.windows, state.plugin_windows, state.favorites);
         {
             std::scoped_lock lock(plugin_window_visibility_mutex_);
             plugin_window_visibility_ = std::move(state.plugin_windows);
+        }
+        {
+            std::scoped_lock lock(favorite_plugins_mutex_);
+            favorite_plugins_ = std::move(state.favorites);
         }
     } catch (const std::exception& exception) {
         Log(ANOMALY_CORE_LOG_LEVEL_V1_WARNING, "UI window state load failed: " + std::string(exception.what()));
@@ -5136,8 +5139,13 @@ void PluginManager::SavePersistentUiWindowState(const bool force) noexcept {
             std::scoped_lock visibility_lock(plugin_window_visibility_mutex_);
             plugin_windows = plugin_window_visibility_;
         }
+        std::unordered_set<std::string> favorites;
+        {
+            std::scoped_lock favorites_lock(favorite_plugins_mutex_);
+            favorites = favorite_plugins_;
+        }
         const std::string document = SerializeUiWindowState(
-            ui_resources_->ExportPersistentWindowState(), plugin_windows);
+            ui_resources_->ExportPersistentWindowState(), plugin_windows, favorites);
         if (document == ui_window_state_last_document_) {
             ui_window_state_last_save_ = now;
             return;
@@ -5210,10 +5218,25 @@ PluginMaintenanceTiming PluginManager::MaintenancePluginState() {
 
 void PluginManager::RetryWaitingForAdapterServices() {
     const std::uint64_t revision = anomaly::ProcessAdapterServices().Revision();
-    if (revision == observed_adapter_service_revision_) return;
+    const bool revision_changed = revision != observed_adapter_service_revision_;
     observed_adapter_service_revision_ = revision;
     if (ui_service_ == nullptr) return;
 
+    // The caller drives this from a 10 ms maintenance loop, so the common case has to stay
+    // cheap: one atomic read plus one clock read. Built-in service readiness (UI,
+    // plugin-provided services) never changes the adapter revision, which is why this timer
+    // exists at all; the plugin scan only runs when the slow period is actually due.
+    const auto now = std::chrono::steady_clock::now();
+    constexpr std::chrono::seconds kWaitingRetryPeriod{5};
+    if (!revision_changed && last_waiting_service_retry_ != std::chrono::steady_clock::time_point{} &&
+        now - last_waiting_service_retry_ < kWaitingRetryPeriod) {
+        return;
+    }
+    last_waiting_service_retry_ = now;
+
+    const bool waiting = std::ranges::any_of(
+        plugins_, [](const auto& plugin) { return plugin->waiting_for_service; });
+    if (!waiting) return;
     RetryWaitingPlugins();
 }
 
@@ -5255,6 +5278,25 @@ void PluginManager::SetPersistentPluginWindowVisibility(
         plugin_window_visibility_.insert_or_assign(std::string(plugin_id), visible);
     } catch (...) {
     }
+}
+
+void PluginManager::SetPluginFavorite(
+    const std::string_view plugin_id, const bool favorite) noexcept {
+    try {
+        if (plugin_id.empty() || plugin_id.size() > kMaximumPluginIdBytes) return;
+        std::scoped_lock lock(favorite_plugins_mutex_);
+        if (favorite) {
+            favorite_plugins_.insert(std::string(plugin_id));
+        } else {
+            favorite_plugins_.erase(std::string(plugin_id));
+        }
+    } catch (...) {
+    }
+}
+
+std::unordered_set<std::string> PluginManager::FavoritePlugins() const {
+    std::scoped_lock lock(favorite_plugins_mutex_);
+    return favorite_plugins_;
 }
 
 void PluginManager::GameUpdate(double delta_seconds) {
@@ -5396,10 +5438,6 @@ bool PluginManager::ReloadPackages(const std::vector<std::string>& package_names
     for (const std::string& id : plan.load_order) {
         if (!affected.contains(id)) continue;
         const anomaly::PluginCatalogEntry* entry = catalog.Find(id);
-        if (entry != nullptr && !LoadAllowed(*entry)) {
-            PublishSuspended(*entry);
-            continue;
-        }
         const auto decision = decisions.find(id);
         if (entry != nullptr && decision != decisions.end() && !decision->second.enabled) {
             publish_disabled(*entry, decision->second.reason);
@@ -6092,7 +6130,7 @@ PluginRuntimeDiagnosticsSnapshot PluginManager::DiagnosticsSnapshot() const {
                 ServiceCandidate{ANOMALY_NTE_ESC_MENU_BUTTON_SERVICE_V1_ID,
                     plugin.service_context.nte_esc_menu_button.service_version, true},
                 ServiceCandidate{ANOMALY_SIGNATURE_SERVICE_V1_ID,
-                    plugin.service_context.signature.service_version, true},
+                    plugin.service_context.signature_v2.service_version, true},
                 ServiceCandidate{ANOMALY_HOOK_SERVICE_V1_ID,
                     plugin.service_context.hook.service_version, true},
                 ServiceCandidate{ANOMALY_PATCH_SERVICE_V1_ID,

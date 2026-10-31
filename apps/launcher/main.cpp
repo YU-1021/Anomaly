@@ -1,3 +1,4 @@
+#include "anomaly/liquid_glass.hpp"
 #include "anomaly/launcher/manual_map.hpp"
 #include "anomaly/launcher/configuration.hpp"
 #include "anomaly/launcher/proxy_installation.hpp"
@@ -5,7 +6,6 @@
 #include "anomaly/platform_ui_layout.hpp"
 #include "anomaly/platform_ui_theme.hpp"
 #include "anomaly/runtime_launch.hpp"
-#include "anomaly/runtime_recovery.hpp"
 #include "anomaly/ui_resource_decoder.hpp"
 #include "config.hpp"
 
@@ -105,12 +105,16 @@ enum class MessageKind : std::uint8_t { Neutral, Success, Error };
 // One decoded theme image. The worker decodes and the render thread only
 // uploads, so a large background never stalls on WIC during a frame.
 struct LauncherThemeImage final {
-    std::vector<std::uint8_t> pixels;
+    // Only the upload reads these; they are dropped as soon as the texture owns the
+    // picture, which is why the field is mutable behind a shared const theme.
+    mutable std::vector<std::uint8_t> pixels;
     std::uint32_t width{};
     std::uint32_t height{};
 
     [[nodiscard]] bool Ok() const noexcept {
-        return width != 0 && height != 0 && !pixels.empty();
+        // Dimensions are set together with a successful decode, so this keeps saying
+        // yes after the pixels are gone.
+        return width != 0 && height != 0;
     }
 };
 
@@ -141,14 +145,16 @@ struct LauncherMessage final {
 // owns: the initial scan, settings and hotkey writes.
 enum class MessageScope { Both, Proxy, Attach };
 
+// When a process rescan is allowed to write the status line: a background poll must not overwrite an
+// outcome, but it does have to correct a status that has become untrue.
+enum class ProcessAnnounce { Never, Always, OnChange };
+
 struct LauncherSnapshot final {
     anomaly::launcher::NteClient selected_client{
         anomaly::launcher::NteClient::MainlandChina};
     std::filesystem::path game_directory;
     std::filesystem::path launcher_executable;
     anomaly::launcher::ProxyInstallationStatus proxy;
-    std::optional<anomaly::RuntimeRecoveryState> recovery;
-    std::string recovery_message;
     std::vector<anomaly::launcher::AttachableProcess> processes;
     DWORD attached_process{};
     bool core_available{};
@@ -397,17 +403,26 @@ std::string Ellipsize(std::string_view value, float width) {
     return std::string(suffix);
 }
 
+// Every icon the launcher draws, and therefore the whole icon font it bakes. A glyph
+// that is not in this list cannot be drawn, so adding one here is what makes it
+// available as well as visible.
+constexpr std::array<char32_t, 8> kLauncherIcons{
+    0xe838, 0xe72c, 0xe768, 0xe73e, 0xe7ba, 0xe711, 0xe8b7, 0xe8e5};
+
+// The launcher draws its body text at this multiple of the platform base size and its
+// title with an explicit size from the same font, so one bake serves every string on
+// screen. Another bake would only be a second copy of a 15.7 MB font.
+constexpr std::array kLauncherFontScales{2.00f};
+
 const char* Glyph(char32_t codepoint) {
     struct Entry final { char32_t codepoint; std::string text; };
-    static const std::array entries{
-        Entry{0xe838, EncodeUtf8(0xe838)},
-        Entry{0xe72c, EncodeUtf8(0xe72c)},
-        Entry{0xe768, EncodeUtf8(0xe768)},
-        Entry{0xe73e, EncodeUtf8(0xe73e)},
-        Entry{0xe7ba, EncodeUtf8(0xe7ba)},
-        Entry{0xe711, EncodeUtf8(0xe711)},
-        Entry{0xe8b7, EncodeUtf8(0xe8b7)},
-    };
+    static const std::array<Entry, kLauncherIcons.size()> entries = [] {
+        std::array<Entry, kLauncherIcons.size()> built{};
+        for (std::size_t index = 0; index < built.size(); ++index) {
+            built[index] = Entry{kLauncherIcons[index], EncodeUtf8(kLauncherIcons[index])};
+        }
+        return built;
+    }();
     const auto found = std::find_if(entries.begin(), entries.end(), [codepoint](const auto& entry) {
         return entry.codepoint == codepoint;
     });
@@ -478,8 +493,7 @@ public:
             const auto saved = PersistConfigurationImpl();
             RefreshHotkeyImpl();
             RefreshProxyImpl();
-            RefreshRecoveryImpl();
-            RefreshProcessesImpl(false);
+            RefreshProcessesImpl(ProcessAnnounce::Never);
             if (!saved.Ok()) {
                 PublishMessage(anomaly::MessageId::LauncherStatusUnexpectedFailure,
                     MessageKind::Error, saved.message);
@@ -490,8 +504,7 @@ public:
     void RefreshProxy() {
         Queue(anomaly::MessageId::LauncherStatusInspectingProxy, MessageScope::Proxy, [this] {
             RefreshProxyImpl();
-            RefreshRecoveryImpl();
-            RefreshProcessesImpl(false);
+            RefreshProcessesImpl(ProcessAnnounce::Never);
         });
     }
 
@@ -500,8 +513,7 @@ public:
             const auto game = GameDirectory();
             const auto result = anomaly::launcher::InstallProxyRuntime(game, source_);
             PublishProxy(result);
-            RefreshRecoveryImpl();
-            RefreshProcessesImpl(false);
+            RefreshProcessesImpl(ProcessAnnounce::Never);
         });
     }
 
@@ -516,17 +528,32 @@ public:
         });
     }
 
-    void RestoreRecovery(anomaly::RuntimeRecoveryAxis axis) {
-        Queue(anomaly::MessageId::LauncherStatusRestoringRecovery, MessageScope::Proxy, [this, axis] {
-            const auto runtime_root = GameDirectory() / L"Anomaly";
-            anomaly::RuntimeRecoveryStore store(runtime_root);
-            PublishRecovery(store.Restore(axis), true);
-        });
-    }
-
     void RefreshProcesses() {
         Queue(anomaly::MessageId::LauncherStatusScanningProcesses,
             MessageScope::Attach, [this] { RefreshProcessesImpl(); });
+    }
+
+    // A game that starts after this window is up would otherwise leave the list empty until the user asks
+    // for a scan. Polling keeps it current: the work runs on the worker like every other operation, but it
+    // is silent -- it never takes the busy flag, so buttons do not flicker, and it never writes the status
+    // line, so an outcome stays readable while the list behind it catches up.
+    void PollProcesses() {
+        constexpr auto kInterval = std::chrono::seconds(2);
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (state_.busy) return;
+            const auto now = std::chrono::steady_clock::now();
+            if (last_process_poll_ != std::chrono::steady_clock::time_point{} &&
+                now - last_process_poll_ < kInterval) {
+                return;
+            }
+            last_process_poll_ = now;
+        }
+        {
+            std::scoped_lock lock(queue_mutex_);
+            queue_.push_back([this] { RefreshProcessesImpl(ProcessAnnounce::OnChange); });
+        }
+        queue_changed_.notify_one();
     }
 
     void SelectLauncherExecutable(std::filesystem::path executable) {
@@ -557,8 +584,6 @@ public:
             state_.game_directory = selected.game_directory;
             state_.launcher_executable = selected.launcher_executable;
             state_.proxy = {};
-            state_.recovery.reset();
-            state_.recovery_message.clear();
             state_.attached_process = 0;
         }
         Queue(anomaly::MessageId::LauncherStatusScanningLocal, MessageScope::Both, [this] {
@@ -566,7 +591,6 @@ public:
             const auto saved = PersistConfigurationImpl();
             RefreshHotkeyImpl();
             RefreshProxyImpl();
-            RefreshRecoveryImpl();
             RefreshProcessesImpl();
             if (!saved.Ok()) {
                 PublishMessage(anomaly::MessageId::LauncherStatusUnexpectedFailure,
@@ -628,6 +652,48 @@ public:
                 state_.message = MakeLauncherMessage(
                     anomaly::MessageId::LauncherStatusLaunchAttachFailed, {error},
                     result.mapping.message);
+                state_.message_kind = MessageKind::Error;
+            }
+        });
+    }
+
+    // Live attach: map the core into a game the player started from its own shortcut, at whatever point
+    // they start the launcher. Nothing is relaunched and nothing is terminated, so a failed attach leaves
+    // the running game exactly as it was.
+    void InjectIntoRunningProcess(const DWORD process_id) {
+        if (process_id == 0) return;
+        Queue(anomaly::MessageId::LauncherStatusInjectingProcess, MessageScope::Attach,
+            [this, process_id] {
+            const auto selected = ResolveAttachRuntime();
+            if (!selected.Ok()) {
+                PublishRuntimeFailure(selected);
+                return;
+            }
+            anomaly::launcher::ManualMapOptions options;
+            options.process_id = process_id;
+            options.core_path = selected.core_path;
+            options.runtime_root = selected.runtime_root;
+            options.log_directory = options.runtime_root / L"logs";
+            // Which way into a game that is already running can work depends on what that game is doing
+            // at this moment: whether a thread reaches an alertable wait, whether one is parked in a
+            // system call. The mapper tries them in turn rather than making the user guess.
+            options.delivery = anomaly::launcher::ManualMapDelivery::Automatic;
+            const auto result = anomaly::launcher::AttachToRunningProcess(options);
+            // Announce is off: the rescan would report the attachment in the launched wording and
+            // replace the message this action is about to publish.
+            if (result.Ok()) RefreshProcessesImpl(ProcessAnnounce::Never);
+
+            std::scoped_lock lock(state_mutex_);
+            if (result.Ok()) {
+                state_.attached_process = process_id;
+                const std::string target = std::to_string(process_id);
+                state_.message = MakeLauncherMessage(
+                    anomaly::MessageId::LauncherStatusInjected, {target});
+                state_.message_kind = MessageKind::Success;
+            } else {
+                const std::string error = std::to_string(result.win32_error);
+                state_.message = MakeLauncherMessage(
+                    anomaly::MessageId::LauncherStatusInjectFailed, {error}, result.message);
                 state_.message_kind = MessageKind::Error;
             }
         });
@@ -783,45 +849,6 @@ private:
             : MessageKind::Error;
     }
 
-    void RefreshRecoveryImpl() {
-        const auto runtime_root = GameDirectory() / L"Anomaly";
-        std::error_code error;
-        if (!std::filesystem::is_directory(runtime_root, error) || error) {
-            std::scoped_lock lock(state_mutex_);
-            state_.recovery.reset();
-            state_.recovery_message.clear();
-            return;
-        }
-        anomaly::RuntimeRecoveryStore store(runtime_root);
-        PublishRecovery(store.Load(), false);
-    }
-
-    void PublishRecovery(anomaly::RuntimeRecoveryResult result, bool announce) {
-        std::scoped_lock lock(state_mutex_);
-        if (result.Ok()) {
-            state_.recovery = std::move(result.state);
-            state_.recovery_message.clear();
-            if (announce) {
-                state_.message = MakeLauncherMessage(
-                    anomaly::MessageId::LauncherStatusRecoveryRestored);
-                state_.message_kind = MessageKind::Success;
-            }
-            return;
-        }
-        state_.recovery.reset();
-        if (result.error == anomaly::RuntimeRecoveryError::StateUnavailable) {
-            state_.recovery_message.clear();
-            return;
-        }
-        state_.recovery_message = std::move(result.message);
-        if (announce) {
-            state_.message = MakeLauncherMessage(
-                anomaly::MessageId::LauncherStatusRecoveryRestoreFailed, {},
-                state_.recovery_message);
-            state_.message_kind = MessageKind::Error;
-        }
-    }
-
     void InitializePathsImpl() {
         const auto loaded = anomaly::launcher::LoadLauncherConfiguration(configuration_path_);
         const auto game_processes = anomaly::launcher::EnumerateAttachableProcesses();
@@ -870,7 +897,6 @@ private:
         const auto saved = PersistConfigurationImpl();
         RefreshHotkeyImpl();
         RefreshProxyImpl();
-        RefreshRecoveryImpl();
         RefreshProcessesImpl();
         RefreshThemeImpl();
         if (!saved.Ok()) {
@@ -892,6 +918,14 @@ private:
         options.client = client;
         options.payload_root = payload_root_;
         options.allow_unpaired_game_discovery = true;
+        // A game that is already running is the surest pairing there is: its own directory is where the client
+        // the user is switching to is installed, and it is the directory the process list filters on next. It
+        // only fills a directory that is not known yet -- a stored one always wins in the discovery below.
+        for (const auto& process : anomaly::launcher::EnumerateAttachableProcesses()) {
+            if (!process.executable_path.empty()) {
+                options.running_game_executables.push_back(process.executable_path);
+            }
+        }
         const auto discovered = anomaly::launcher::DiscoverLauncherConfiguration(
             preferred, options);
         std::scoped_lock lock(state_mutex_);
@@ -922,7 +956,7 @@ private:
         state_.theme = std::move(theme);
     }
 
-    void RefreshProcessesImpl(bool announce = true) {
+    void RefreshProcessesImpl(ProcessAnnounce announce = ProcessAnnounce::Always) {
         auto processes = anomaly::launcher::EnumerateAttachableProcesses();
         const auto game_directory = GameDirectory();
         if (!game_directory.empty()) {
@@ -934,6 +968,7 @@ private:
         const auto runtime = ResolveAttachRuntime();
         const bool core_available = runtime.Ok();
         std::scoped_lock lock(state_mutex_);
+        const bool had_processes = !state_.processes.empty();
         state_.processes = std::move(processes);
         state_.core_available = core_available;
         state_.runtime_version = runtime.version;
@@ -945,7 +980,12 @@ private:
                 })) {
             state_.attached_process = 0;
         }
-        if (!announce) {
+        if (announce == ProcessAnnounce::Never) {
+            return;
+        }
+        // The background poll only speaks when the answer changed, so a list that fills in does not keep
+        // claiming that nothing is running.
+        if (announce == ProcessAnnounce::OnChange && had_processes == !state_.processes.empty()) {
             return;
         }
         if (!core_available) {
@@ -989,6 +1029,8 @@ private:
     std::mutex queue_mutex_;
     std::condition_variable_any queue_changed_;
     std::deque<Work> queue_;
+    // Throttles PollProcesses: a per-frame caller must not turn into a per-frame process scan.
+    std::chrono::steady_clock::time_point last_process_poll_{};
     std::jthread worker_;
 };
 
@@ -1238,6 +1280,14 @@ void UploadLauncherTheme(
         graphics.theme_sticker_sizes.emplace_back(
             static_cast<float>(width), static_cast<float>(height));
     }
+    // The textures are the picture now. Keeping the decoded RGBA8 copies would hold
+    // the wallpaper and both stickers resident -- 15 MB -- for a frame that draws
+    // from the textures, so nothing reads them again.
+    const auto release_pixels = [](const LauncherThemeImage& image) {
+        std::vector<std::uint8_t>().swap(image.pixels);
+    };
+    release_pixels(theme->background);
+    for (const LauncherThemeImage& image : theme->stickers) release_pixels(image);
 }
 
 // The launcher shares the palette and layout the in-game shell uses, so a theme
@@ -1267,6 +1317,7 @@ void DrawLauncherThemeImages(
     // bands beside it are transparent margin, and painting either of them there would
     // fill those bands in.
     list->PushClipRect(origin, ImVec2(origin.x + size.x, origin.y + size.y), true);
+    const float body_rounding = ImGui::GetStyle().WindowRounding;
     if (!front) {
         // The window contributes no body of its own: it has no redirection bitmap, and
         // every panel fill is empty while a theme is active. The shell therefore paints
@@ -1275,7 +1326,7 @@ void DrawLauncherThemeImages(
         // instead of against the surface colour, and whatever sits behind the launcher
         // would show through the window.
         list->AddRectFilled(origin, ImVec2(origin.x + size.x, origin.y + size.y),
-            tint(ue5mem::PlatformUiSurfaceColor(), 1.0f));
+            tint(ue5mem::PlatformUiSurfaceColor(), 1.0f), body_rounding);
     }
     if (!front && graphics.theme_background != nullptr &&
         graphics.theme_background_width != 0 && graphics.theme_background_height != 0) {
@@ -1285,14 +1336,19 @@ void DrawLauncherThemeImages(
             static_cast<float>(graphics.theme_background_height),
             origin.x, origin.y, size.x, size.y);
         if (placement.Visible()) {
-            list->AddImage(
+            const bool covers_body = placement.x <= origin.x + 0.5f &&
+                placement.y <= origin.y + 0.5f &&
+                placement.x + placement.width >= origin.x + size.x - 0.5f &&
+                placement.y + placement.height >= origin.y + size.y - 0.5f;
+            list->AddImageRounded(
                 static_cast<ImTextureID>(
                     reinterpret_cast<std::uintptr_t>(graphics.theme_background.Get())),
                 ImVec2(placement.x, placement.y),
                 ImVec2(placement.x + placement.width, placement.y + placement.height),
                 ImVec2(placement.uv0_x, placement.uv0_y),
                 ImVec2(placement.uv1_x, placement.uv1_y),
-                tint(layout.background.tint, layout.background.opacity));
+                tint(layout.background.tint, layout.background.opacity),
+                covers_body ? body_rounding : 0.0f);
         }
     }
     // The shell paints one translucent veil between its wallpaper and its
@@ -1306,7 +1362,7 @@ void DrawLauncherThemeImages(
             wallpaper ? ue5mem::GetPlatformUiSurfaceAlpha() : 1.0f;
         if (veil_alpha > 0.0f) {
             list->AddRectFilled(origin, ImVec2(origin.x + size.x, origin.y + size.y),
-                tint(ue5mem::PlatformUiSurfaceColor(), veil_alpha));
+                tint(ue5mem::PlatformUiSurfaceColor(), veil_alpha), body_rounding);
         }
     }
     list->PopClipRect();
@@ -1446,6 +1502,20 @@ std::optional<std::filesystem::path> ChooseGameDirectory(
     return result;
 }
 
+// The file name the selected client's official launcher ships under. The two installs are separate programs
+// with separate launchers, so a label that names one of them has to name the one this client actually starts.
+const char* ClientLauncherFileName(const anomaly::launcher::NteClient client) noexcept {
+    return client == anomaly::launcher::NteClient::Global
+        ? "NTEGlobalLauncher.exe" : "NTELauncher.exe";
+}
+
+std::string Format(
+    const anomaly::Translator& translator, anomaly::MessageId id,
+    std::initializer_list<std::string_view> arguments) {
+    return translator.Format(id, std::span<const std::string_view>(
+        arguments.begin(), arguments.size()));
+}
+
 std::optional<std::filesystem::path> ChooseLauncherExecutable(
     HWND owner, const std::filesystem::path& current,
     const anomaly::launcher::NteClient client, const anomaly::Translator& translator) {
@@ -1472,8 +1542,9 @@ std::optional<std::filesystem::path> ChooseLauncherExecutable(
     };
     static_cast<void>(dialog->SetFileTypes(
         static_cast<UINT>(std::size(filters)), filters));
-    const std::wstring title = Utf8Wide(
-        translator.Text(anomaly::MessageId::LauncherDialogNteLauncher));
+    const std::wstring title = Utf8Wide(Format(
+        translator, anomaly::MessageId::LauncherDialogNteLauncher,
+        {ClientLauncherFileName(client)}));
     dialog->SetTitle(title.c_str());
     if (!current.empty()) {
         ComPtr<IShellItem> folder;
@@ -1504,7 +1575,9 @@ bool IconButton(const char* id, char32_t glyph, const char* tooltip, bool enable
     ImGui::PushID(id);
     ImGui::BeginDisabled(!enabled);
     const float extent = ButtonHeight(38.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, extent * 0.36f);
     const bool pressed = ImGui::Button("##icon", ImVec2(extent, extent));
+    ImGui::PopStyleVar();
     // The mark is centred by hand. These are private-use icon glyphs whose bearing
     // and advance are not symmetric, so leaving the centring to the text layout
     // puts them visibly off centre inside the frame.
@@ -1536,44 +1609,35 @@ bool CommandButton(
     const auto& theme = ue5mem::PlatformUiTheme();
     ImGui::PushID(id);
     ImGui::PushStyleColor(ImGuiCol_Button,
-        ThemeColor(primary ? theme.accent : theme.button));
+        primary ? ThemeColor(theme.accent) : ImVec4(0.0f, 0.0f, 0.0f, 0.07f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-        ThemeColor(primary ? theme.accent_hovered : theme.button_hovered));
+        primary ? ThemeColor(theme.accent_hovered) : ImVec4(0.0f, 0.0f, 0.0f, 0.11f));
     ImGui::PushStyleColor(
         ImGuiCol_ButtonActive,
-        ThemeColor(primary ? theme.accent_active : theme.button_active));
+        primary ? ThemeColor(theme.accent_active) : ImVec4(0.0f, 0.0f, 0.0f, 0.16f));
     // Plain black on the light themed surface. The palette's muted ink is tuned
     // for the shell's own panels; over a wallpaper and its veil it reads as washed
     // out to the point of being unreadable.
     ImGui::PushStyleColor(ImGuiCol_Text, primary
         ? ThemeColor(theme.inverse_text) : ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
     ImGui::BeginDisabled(!enabled);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, scaled_size.y * 0.36f);
     const bool pressed = ImGui::Button(text.c_str(), scaled_size);
+    ImGui::PopStyleVar();
     ImGui::EndDisabled();
     ImGui::PopStyleColor(4);
     ImGui::PopID();
     return pressed && enabled;
 }
 
-bool ModeButton(const char* id, const char* label, bool selected, float width) {
-    const auto& theme = ue5mem::PlatformUiTheme();
-    const ImVec2 size(Scale(width), ButtonHeight(38.0f));
-    const std::string text = Ellipsize(label,
-        (std::max)(0.0f, size.x - ImGui::GetStyle().FramePadding.x * 2.0f));
-    ImGui::PushID(id);
-    ImGui::PushStyleColor(
-        ImGuiCol_Button,
-        selected ? ThemeColorWithAlpha(theme.accent, 0.16f) : ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-        selected ? ThemeColorWithAlpha(theme.accent, 0.26f)
-                 : ThemeColor(theme.button_hovered));
-    // Selection is carried by the accent tint behind the label, so the label
-    // itself stays black and readable in both states.
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
-    const bool pressed = ImGui::Button(text.c_str(), size);
-    ImGui::PopStyleColor(3);
-    ImGui::PopID();
-    return pressed;
+// The width a command button needs for its own label, in the same unscaled units CommandButton takes. A
+// translation is as long as it is: a fixed width ellipsizes the ones that grew.
+float CommandButtonWidth(char32_t glyph, const char* label) {
+    const std::string text = std::string(Glyph(glyph)) + "  " + label;
+    const float pixels = ImGui::CalcTextSize(text.c_str()).x +
+        ImGui::GetStyle().FramePadding.x * 2.0f;
+    const float scale = g_launcher_dpi_scale > 0.0f ? g_launcher_dpi_scale : 1.0f;
+    return std::ceil(pixels / scale) + 6.0f;
 }
 
 const char* Text(const anomaly::Translator& translator, anomaly::MessageId id) noexcept {
@@ -1584,13 +1648,6 @@ std::string StableLabel(
     const anomaly::Translator& translator, anomaly::MessageId id,
     std::string_view stable_id) {
     return anomaly::StableDisplayLabel(translator.Text(id), stable_id);
-}
-
-std::string Format(
-    const anomaly::Translator& translator, anomaly::MessageId id,
-    std::initializer_list<std::string_view> arguments) {
-    return translator.Format(id, std::span<const std::string_view>(
-        arguments.begin(), arguments.size()));
 }
 
 std::string RenderMessage(
@@ -1625,39 +1682,44 @@ ImVec4 ProxyStateColor(anomaly::launcher::ProxyInstallationState state) {
 void DrawModes(
     LauncherController& controller, const LauncherSnapshot& snapshot,
     LauncherMode& mode, const anomaly::Translator& translator) {
-    const auto& theme = ue5mem::PlatformUiTheme();
     const bool proxy_enabled = snapshot.proxy.state ==
         anomaly::launcher::ProxyInstallationState::Enabled;
     if (proxy_enabled && mode == LauncherMode::Attach) {
         mode = LauncherMode::Proxy;
     }
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, Scale(16.0f, 9.0f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ThemeColor(theme.toolbar_background));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
     ImGui::BeginChild(
         "LauncherModes", ImVec2(0.0f, Scale(kModeHeight)),
         ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
-    if (ImGui::BeginTable("LauncherToolbar", 2, ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("Modes", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Client", ImGuiTableColumnFlags_WidthFixed, Scale(190.0f));
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        if (ModeButton("proxy-install", Text(translator,
-                anomaly::MessageId::LauncherModeProxyInstall),
-                mode == LauncherMode::Proxy, 126.0f)) {
-            mode = LauncherMode::Proxy;
-        }
-        ImGui::SameLine();
-        ImGui::BeginDisabled(snapshot.busy || proxy_enabled);
-        if (ModeButton("live-attach", Text(translator,
-                anomaly::MessageId::LauncherModeLiveAttach),
-                mode == LauncherMode::Attach, 126.0f)) {
-            mode = LauncherMode::Attach;
-        }
-        ImGui::EndDisabled();
-        // The client is always the mainland one. The switch that used to live in
-        // the second column only ever had one useful setting, and NteClient's
-        // default already is MainlandChina, so the column is simply gone.
-        ImGui::EndTable();
+    const std::array<const char*, 2> labels{
+        Text(translator, anomaly::MessageId::LauncherModeProxyInstall),
+        Text(translator, anomaly::MessageId::LauncherModeLiveAttach)};
+    anomaly::glass::SegmentedOptions options;
+    options.height = 46.0f;
+    options.padding_x = 30.0f;
+    options.scale = g_launcher_dpi_scale;
+    options.disabled_mask = snapshot.busy || proxy_enabled ? 0b10U : 0U;
+    int selected = mode == LauncherMode::Attach ? 1 : 0;
+    if (anomaly::glass::SegmentedControl("launcher-modes", labels, selected, options)) {
+        mode = selected == 1 ? LauncherMode::Attach : LauncherMode::Proxy;
+    }
+    // The client sits right beside the mode, on the same band: it decides which game directory the process
+    // list, the proxy install and the launch all read from, and the two installs live in different
+    // directories -- a game under the client that is not selected is not in the list at all. The labels are
+    // the clients' own names in both locales, so they are not translated.
+    ImGui::SameLine(0.0f, Scale(12.0f));
+    const std::array<const char*, 2> clients{"CN", "Global"};
+    anomaly::glass::SegmentedOptions client_options;
+    client_options.height = 46.0f;
+    client_options.padding_x = 20.0f;
+    client_options.scale = g_launcher_dpi_scale;
+    client_options.disabled_mask = snapshot.busy ? 0b11U : 0U;
+    int client = snapshot.selected_client == anomaly::launcher::NteClient::Global ? 1 : 0;
+    if (anomaly::glass::SegmentedControl("launcher-client", clients, client, client_options)) {
+        controller.SelectClient(client == 1
+            ? anomaly::launcher::NteClient::Global
+            : anomaly::launcher::NteClient::MainlandChina);
     }
     ImGui::EndChild();
     ImGui::PopStyleColor();
@@ -1675,83 +1737,6 @@ void DrawReadOnlyPath(
     ImGui::InputText(
         id, value.data(), value.size() + 1,
         ImGuiInputTextFlags_ReadOnly);
-}
-
-void DrawRecoveryAxis(
-    LauncherController& controller, const LauncherSnapshot& snapshot,
-    const anomaly::Translator& translator, const char* stable_id,
-    anomaly::MessageId label, anomaly::MessageId action,
-    anomaly::RuntimeRecoveryAxis axis) {
-    ImGui::TableNextRow(ImGuiTableRowFlags_None, Scale(28.0f));
-    ImGui::TableSetColumnIndex(0);
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(Text(translator, label));
-    ImGui::TableSetColumnIndex(1);
-    ImGui::BeginDisabled(snapshot.busy);
-    ImGui::PushID(stable_id);
-    if (ImGui::SmallButton(Text(translator, action))) controller.RestoreRecovery(axis);
-    ImGui::PopID();
-    ImGui::EndDisabled();
-}
-
-void DrawRecoveryState(
-    LauncherController& controller, const LauncherSnapshot& snapshot,
-    const anomaly::Translator& translator) {
-    const auto& theme = ue5mem::PlatformUiTheme();
-    const bool active = snapshot.recovery && snapshot.recovery->safe_mode.Active();
-    if (!active && snapshot.recovery_message.empty()) return;
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-    ImGui::TextDisabled("%s", Text(translator, anomaly::MessageId::LauncherSectionRecovery));
-    if (!snapshot.recovery_message.empty()) {
-        ImGui::PushTextWrapPos();
-        ImGui::TextColored(ThemeColor(theme.danger), "%s", snapshot.recovery_message.c_str());
-        ImGui::PopTextWrapPos();
-        return;
-    }
-
-    const auto& safe_mode = snapshot.recovery->safe_mode;
-    ImGui::TextColored(ThemeColor(theme.warning), "%s",
-        Text(translator, anomaly::MessageId::LauncherRecoverySafeModeActive));
-    if (!safe_mode.reason.empty()) {
-        ImGui::SameLine();
-        ImGui::TextColored(kLauncherMutedInk, "%s", safe_mode.reason.c_str());
-    }
-    if (ImGui::BeginTable(
-            "RecoveryAxes", 2, ImGuiTableFlags_SizingStretchProp,
-            ImVec2(0.0f, 0.0f))) {
-        const std::string axis_column = StableLabel(translator,
-            anomaly::MessageId::LauncherRecoveryAxis, "recovery-axis");
-        const std::string action_column = StableLabel(translator,
-            anomaly::MessageId::LauncherRecoveryAction, "recovery-action");
-        ImGui::TableSetupColumn(axis_column.c_str(), ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn(
-            action_column.c_str(), ImGuiTableColumnFlags_WidthFixed, Scale(72.0f));
-        if (safe_mode.minimal_core) {
-            DrawRecoveryAxis(
-                controller, snapshot, translator, "minimal-core",
-                anomaly::MessageId::LauncherRecoveryMinimalCore,
-                anomaly::MessageId::LauncherRecoveryRestore,
-                anomaly::RuntimeRecoveryAxis::MinimalCore);
-        }
-        if (safe_mode.third_party_plugins_suspended) {
-            DrawRecoveryAxis(
-                controller, snapshot, translator, "third-party-plugins",
-                anomaly::MessageId::LauncherRecoveryThirdPartyPlugins,
-                anomaly::MessageId::LauncherRecoveryRestore,
-                anomaly::RuntimeRecoveryAxis::ThirdPartyPlugins);
-        }
-        if (safe_mode.profile_overrides_suspended) {
-            DrawRecoveryAxis(
-                controller, snapshot, translator, "profile-overrides",
-                anomaly::MessageId::LauncherRecoveryProfileOverrides,
-                anomaly::MessageId::LauncherRecoveryRestore,
-                anomaly::RuntimeRecoveryAxis::ProfileOverrides);
-        }
-        ImGui::EndTable();
-    }
 }
 
 void DrawStartupSettings(
@@ -1859,8 +1844,6 @@ void DrawProxyMode(
         ImGui::PopTextWrapPos();
     }
 
-    DrawRecoveryState(controller, snapshot, translator);
-
     // Pinned to a fixed band rather than derived from the cursor: taking the
     // larger of the two made each mode's button land at a different height,
     // because the content above them differs in length. This is the same band the
@@ -1925,9 +1908,11 @@ void DrawAttachMode(
     DrawReadOnlyPath(
         "##NteLauncherExecutable", snapshot.launcher_executable, 38.0f, translator);
     ImGui::SameLine();
+    const std::string choose_label = Format(
+        translator, anomaly::MessageId::LauncherChooseNteLauncher,
+        {ClientLauncherFileName(snapshot.selected_client)});
     if (IconButton(
-            "choose-nte-launcher", 0xe838,
-            Text(translator, anomaly::MessageId::LauncherChooseNteLauncher),
+            "choose-nte-launcher", 0xe838, choose_label.c_str(),
             !snapshot.busy)) {
         if (const auto selected = ChooseLauncherExecutable(
                 window, snapshot.launcher_executable, snapshot.selected_client, translator)) {
@@ -1971,15 +1956,35 @@ void DrawAttachMode(
 
     const bool can_launch = !snapshot.busy && snapshot.core_available &&
         !snapshot.launcher_executable.empty() && snapshot.processes.empty();
-    // The same bottom-right placement and size as the proxy mode's primary action,
-    // so switching modes does not move the button under the cursor.
+    // A game that is already running is the other half of the same choice: the launch action needs an
+    // empty process list, this one needs a target in it.
+    DWORD inject_target{};
+    for (const auto& process : snapshot.processes) {
+        if (process.Compatible()) {
+            inject_target = process.process_id;
+            break;
+        }
+    }
+    const bool can_inject = !snapshot.busy && snapshot.core_available && inject_target != 0;
+    // The same bottom-right placement and size as the proxy mode's primary action, so switching modes does not
+    // move the button under the cursor -- but the widths are measured from the labels, because a fixed width
+    // ellipsized the English "Inject into running process" down to "Inject into running ...".
+    const char* inject_label = Text(translator, anomaly::MessageId::LauncherActionInjectRunning);
+    const char* launch_label = Text(translator, anomaly::MessageId::LauncherLaunchAttach);
+    const float inject_width = (std::max)(200.0f, CommandButtonWidth(0xe8e5, inject_label));
+    const float launch_width = (std::max)(240.0f, CommandButtonWidth(0xe768, launch_label));
     ImGui::SetCursorPosY(ImGui::GetWindowHeight() - Scale(74.0f));
     ImGui::SetCursorPosX((std::max)(ImGui::GetCursorPosX(),
-        ImGui::GetWindowWidth() - Scale(240.0f) - Scale(16.0f)));
+        ImGui::GetWindowWidth() - Scale(inject_width + 12.0f + launch_width) - Scale(16.0f)));
     if (CommandButton(
-            "launch-attach-core", 0xe768,
-            Text(translator, anomaly::MessageId::LauncherLaunchAttach), true, can_launch,
-            ImVec2(240.0f, 62.0f))) {
+            "inject-running-process", 0xe8e5, inject_label, false,
+            can_inject, ImVec2(inject_width, 62.0f))) {
+        controller.InjectIntoRunningProcess(inject_target);
+    }
+    ImGui::SameLine(0.0f, Scale(12.0f));
+    if (CommandButton(
+            "launch-attach-core", 0xe768, launch_label, true, can_launch,
+            ImVec2(launch_width, 62.0f))) {
         controller.LaunchAndAttach();
     }
 }
@@ -2136,7 +2141,10 @@ void DrawLauncherTitleBar(
 void DrawLauncher(
     HWND window, Graphics& graphics, LauncherController& controller, LauncherMode& mode,
     const anomaly::Translator& translator) {
-    const auto& theme = ue5mem::PlatformUiTheme();
+    // Runs every frame whatever page is showing: a game that starts after this window is up has to appear
+    // in the list without the user pressing anything, and the poll throttles itself to one scan every couple
+    // of seconds on the worker thread.
+    controller.PollProcesses();
     const LauncherSnapshot snapshot = controller.Snapshot();
     ApplyLauncherTheme(snapshot.theme);
     UploadLauncherTheme(graphics, snapshot.theme);
@@ -2159,12 +2167,26 @@ void DrawLauncher(
     const ImVec2 root_origin = ImGui::GetWindowPos();
     const ImVec2 root_size = ImGui::GetWindowSize();
     DrawLauncherThemeImages(graphics, snapshot.theme, root_origin, root_size, false);
+    anomaly::glass::CaptureBackdrop(ImGui::GetWindowDrawList());
     DrawLauncherTitleBar(graphics, translator);
     DrawModes(controller, snapshot, mode, translator);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, Scale(16.0f, 16.0f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ThemeColor(theme.window_background));
+    // The body is one frosted card inset from the canvas edge, so the wallpaper
+    // and the stickers stay visible around it and refract through it.
+    {
+        const ImVec2 card_min(root_origin.x + Scale(14.0f), ImGui::GetCursorScreenPos().y);
+        const ImVec2 card_max(root_origin.x + root_size.x - Scale(14.0f),
+            root_origin.y + root_size.y - Scale(14.0f));
+        anomaly::glass::SurfaceOptions card;
+        card.variant = anomaly::glass::Variant::Regular;
+        card.rounding = Scale(20.0f);
+        card.scale = g_launcher_dpi_scale;
+        anomaly::glass::DrawSurface(ImGui::GetWindowDrawList(), card_min, card_max, card);
+        ImGui::SetCursorScreenPos(card_min);
+    }
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, Scale(20.0f, 18.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
     ImGui::BeginChild(
-        "LauncherBody", ImVec2(0.0f, 0.0f),
+        "LauncherBody", ImVec2(root_size.x - Scale(28.0f), -Scale(14.0f)),
         ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
     if (mode == LauncherMode::Proxy) {
         DrawProxyMode(window, controller, snapshot, translator);
@@ -2255,7 +2277,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     }
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    static_cast<void>(ue5mem::ConfigurePlatformUiFontAtlas(runtime_root));
+    // The launcher owns its whole surface, so it bakes only what it draws: one type
+    // scale, its eight icons, and an atlas no taller than the glyphs need. The host
+    // keeps its own ladder of sizes and the whole icon range for the in-game windows.
+    static_cast<void>(ue5mem::ConfigurePlatformUiFontAtlas(runtime_root,
+        ue5mem::PlatformUiFontBake{
+            .scales = kLauncherFontScales, .icons = kLauncherIcons, .tight_atlas = true}));
     g_launcher_dpi_scale = DpiScale(GetDpiForWindow(window));
     ApplyLauncherDpiScale();
     ImGuiIO& io = ImGui::GetIO();
@@ -2272,6 +2299,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         g_graphics = nullptr;
         return 4;
     }
+    // Losing the glass renderer only costs the effect; every surface keeps a
+    // solid fallback.
+    // The launcher is a desktop window, not an overlay: its composition carries
+    // real alpha, and its material stays neutral rather than palette-tinted.
+    static_cast<void>(anomaly::glass::InitializeRenderer(
+        graphics.device.Get(), graphics.context.Get(), false));
+    // Upload the font atlas now rather than on the first frame, so what it costs
+    // besides its texture can be released before the window is shown. The launcher
+    // owns its device for its lifetime and never adds another font, so it keeps
+    // neither the texture pixels nor the font files.
+    static_cast<void>(ImGui_ImplDX11_CreateDeviceObjects());
+    ue5mem::ReleasePlatformUiFontAtlas(ue5mem::PlatformUiFontRetention::Minimal);
+    ApplyLauncherDpiScale();
     LoadLogo(graphics);
     LauncherController controller(ExecutableDirectory());
     LauncherMode mode = LauncherMode::Proxy;
@@ -2302,6 +2342,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         graphics.context->OMSetRenderTargets(1, graphics.render_target.GetAddressOf(), nullptr);
         const float transparent_clear[4]{0.0f, 0.0f, 0.0f, 0.0f};
         graphics.context->ClearRenderTargetView(graphics.render_target.Get(), transparent_clear);
+        anomaly::glass::PrepareDrawData(ImGui::GetDrawData());
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         graphics.swap_chain->Present(1, 0);
         if (!window_shown) {
@@ -2320,6 +2361,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         }
     }
 
+    anomaly::glass::ShutdownRenderer();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

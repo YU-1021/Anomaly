@@ -1,4 +1,5 @@
-#include "anomaly/host_ui_service.hpp"
+﻿#include "anomaly/host_ui_service.hpp"
+#include "anomaly/liquid_glass.hpp"
 #include "anomaly/platform_ui_theme.hpp"
 #include "anomaly/thread_local_value.hpp"
 
@@ -46,6 +47,12 @@ constexpr float kPluginWindowBodyPadding = 12.0F;
 constexpr float kPluginWindowActionSize = 30.0F;
 constexpr float kPluginWindowActionGap = 4.0F;
 constexpr float kPluginWindowActionRightInset = 12.0F;
+// The icon face carries its weight above the middle of the box it is baked in: a
+// chevron is a roof, a pin is a head over a needle, so their mass sits high even
+// when the ink box is centred, and the pane's drop shadow pulls the middle of the
+// pill down as well. The actions therefore ride slightly below the middle of the
+// header. The hit plate stays centred, so the click target is unchanged.
+constexpr float kPluginWindowActionOpticalDrop = 1.5F;
 
 struct PluginWindowChromeState {
     bool manually_collapsed{};
@@ -220,16 +227,19 @@ bool DrawPluginWindowChromeButton(
     }
 
     const auto& theme = PlatformUiTheme();
-    const ImVec4 raised = ThemeColor(theme.button_hovered);
-    const ImVec4 active = ThemeColor(theme.button_active);
+    const ImVec4 raised = ThemeColorWithAlpha(theme.text, 0.09F);
+    const ImVec4 active = ThemeColorWithAlpha(theme.text, 0.15F);
     const ImVec4 accent = ThemeColor(theme.accent);
     const ImVec4 transparent(0.0F, 0.0F, 0.0F, 0.0F);
-    const ImVec4 background = held ? active : hovered ? raised
-        : selected ? ThemeColorWithAlpha(theme.accent, 0.16F) : transparent;
-    const ImVec4 text = !enabled ? ThemeColor(theme.text_muted)
-        : selected ? accent : ThemeColor(theme.text_muted);
+    static_cast<void>(raised);
+    static_cast<void>(active);
+    const ImVec4 background = selected ? ThemeColorWithAlpha(theme.accent, 0.16F) : transparent;
+    // Hover only brightens the glyph; the glass under it never changes.
+    const ImVec4 text = !enabled ? ThemeColorWithAlpha(theme.text_muted, 0.55F)
+        : selected ? accent
+        : hovered || held ? ThemeColor(theme.text) : ThemeColor(theme.text_muted);
     ImDrawList* const draw_list = window.DrawList;
-    draw_list->AddRectFilled(bounds.Min, bounds.Max, ToU32(background), 3.0F);
+    draw_list->AddRectFilled(bounds.Min, bounds.Max, ToU32(background), bounds.GetHeight() * 0.36F);
     const char* const glyph_text = PluginWindowChromeGlyphText(glyph);
     // Plugin content can select a CJK font, but these are host-owned icon glyphs.
     ImFont* const glyph_font = ImGui::GetIO().FontDefault;
@@ -237,9 +247,25 @@ bool DrawPluginWindowChromeButton(
     const ImVec2 glyph_size = glyph_font != nullptr
         ? glyph_font->CalcTextSizeA(glyph_font_size, FLT_MAX, 0.0F, glyph_text)
         : ImGui::CalcTextSize(glyph_text);
+    // The icon face reserves a descent band underneath every glyph it carries, so
+    // a line box centred on the action leaves the ink riding above the middle of
+    // the header. Centre the glyph's own ink box instead: it is the only part of
+    // the glyph that is drawn, and it holds at any baked font size.
+    float glyph_top = (bounds.GetHeight() - glyph_size.y) * 0.5F;
+    if (glyph_font != nullptr) {
+        unsigned int code_point = 0;
+        static_cast<void>(ImTextCharFromUtf8(&code_point, glyph_text, nullptr));
+        const ImFontGlyph* const ink =
+            glyph_font->FindGlyph(static_cast<ImWchar>(code_point));
+        const float scale = glyph_font_size / glyph_font->FontSize;
+        if (ink != nullptr && ink->Visible && ink->Y1 > ink->Y0) {
+            glyph_top = (bounds.GetHeight() - (ink->Y1 - ink->Y0) * scale) * 0.5F -
+                ink->Y0 * scale;
+        }
+    }
+    glyph_top += kPluginWindowActionOpticalDrop;
     draw_list->AddText(glyph_font, glyph_font_size,
-        Offset(bounds.Min, (bounds.GetWidth() - glyph_size.x) * 0.5F,
-            (bounds.GetHeight() - glyph_size.y) * 0.5F - 1.0F),
+        Offset(bounds.Min, (bounds.GetWidth() - glyph_size.x) * 0.5F, glyph_top),
         ToU32(text), glyph_text);
     if (hovered && tooltip != nullptr) ImGui::SetTooltip("%s", tooltip);
     return pressed;
@@ -265,11 +291,17 @@ bool DrawPluginWindowChrome(
     ImDrawList* const draw_list = window.DrawList;
     const ImRect header(origin, Offset(origin, size.x, kPluginWindowHeaderHeight));
     const auto& theme = PlatformUiTheme();
-    draw_list->AddRectFilled(header.Min, header.Max, ToU32(ThemeColor(theme.header_background)));
-    draw_list->AddLine(
-        Offset(origin, 0.0F, kPluginWindowHeaderHeight - 1.0F),
-        Offset(origin, size.x, kPluginWindowHeaderHeight - 1.0F),
-        ToU32(ThemeColor(theme.border)));
+    const bool collapsed = IsPluginWindowCollapsed(state);
+    // The window body is glass, so the header is only a hairline under the
+    // title rather than a band of its own. A collapsed window has no body to
+    // separate from: its whole height is the header, so the hairline would land
+    // on the rounded bottom edge of the pill and read as a stray line.
+    if (!collapsed) {
+        draw_list->AddLine(
+            Offset(origin, 14.0F, kPluginWindowHeaderHeight - 1.0F),
+            Offset(origin, size.x - 14.0F, kPluginWindowHeaderHeight - 1.0F),
+            ToU32(ThemeColorWithAlpha(theme.text, 0.10F)));
+    }
 
     const float close_x = size.x - kPluginWindowActionRightInset - kPluginWindowActionSize;
     const float pin_x = close_x - kPluginWindowActionGap - kPluginWindowActionSize;
@@ -452,8 +484,12 @@ int ANOMALY_CALL BeginWindow(
         // surface. The themed surface tokens are transparent while a background
         // image is active -- the shell paints its own veil instead -- and using
         // one here would leave the window with no background at all.
-        ImGui::PushStyleColor(
-            ImGuiCol_WindowBg, ThemeColor(anomaly::PlatformUiSurfaceColor()));
+        // With the glass renderer installed the body is drawn by the renderer
+        // under the window, so the fill stays empty.
+        const PlatformUiColor surface = anomaly::PlatformUiSurfaceColor();
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, glass::Active()
+            ? ImVec4(surface.red, surface.green, surface.blue, 0.0F)
+            : ThemeColor(surface));
         ImGui::PushStyleVar(
             ImGuiStyleVar_WindowPadding, ImVec2(kPluginWindowBodyPadding, kPluginWindowBodyPadding));
     }
@@ -461,6 +497,24 @@ int ANOMALY_CALL BeginWindow(
     if (!management_shell) {
         ImGui::PopStyleVar();
         ImGui::PopStyleColor();
+        glass::SurfaceOptions body;
+        body.variant = glass::Variant::Regular;
+        body.rounding = ImGui::GetStyle().WindowRounding;
+        body.clip = false;
+        // A plugin window floats on the game frame itself: no themed veil stands
+        // between its face and a moving scene, so it asks for the deep backdrop
+        // and the heavy face, and carries slightly more of the palette than the
+        // shell's own surfaces do. A label has to stay readable against the
+        // scene, and a light blur leaves its silhouettes running through the text.
+        body.face_blur = 2.0F;
+        // The rim stays nearly as soft as the face: the shipped clamp samples a
+        // much sharper copy along the bevel, which over a deep face drew a hard
+        // ring inside the window -- the outer glass and the blurred body read as
+        // two materials meeting at an edge instead of one pane.
+        body.rim_blur = 1.7F;
+        body.deep_backdrop = true;
+        body.tint_strength = glass::DarkAppearance() ? 0.62F : 0.52F;
+        glass::RegisterWindowSurface(body);
     }
     g_host_ui_window_scopes.Get().emplace_back();
     if (open != nullptr) *open = visible ? 1 : 0;
@@ -547,17 +601,33 @@ void ANOMALY_CALL TextWrapped(void*, AnomalyStringViewV1 value) {
     ImGui::TextWrapped("%s", text.c_str());
 }
 
+// A plugin names its button widths in fixed pixels while the host scales the
+// font and the frame padding with the interface scale. Once the label stops
+// fitting inside the requested width, ImGui gives up on centring it: it pins the
+// text to the left padding and clips the overhang against the frame, so a reset
+// chip that reads centred at 100% reads left-aligned and cut off at 150%. A
+// width is therefore a floor for plugin buttons -- never less than the label it
+// has to show. A non-positive width already means auto-size or fill-the-row.
+ImVec2 PluginButtonSize(
+    const std::string& text, const float width, const float height) {
+    if (!(width > 0.0F)) return ImVec2(width, height);
+    const ImVec2 label_size = ImGui::CalcTextSize(text.c_str(), nullptr, true);
+    const float required = label_size.x + ImGui::GetStyle().FramePadding.x * 2.0F;
+    return ImVec2(width > required ? width : required, height);
+}
+
 int ANOMALY_CALL Button(
     void*, AnomalyStringViewV1 label, float width, float height) {
     const std::string text = Copy(label);
-    return ImGui::Button(text.c_str(), ImVec2(width, height)) ? 1 : 0;
+    return ImGui::Button(text.c_str(), PluginButtonSize(text, width, height)) ? 1 : 0;
 }
 
 int ANOMALY_CALL ButtonEnabled(
     void*, AnomalyStringViewV1 label, float width, float height, int enabled) {
     const std::string text = Copy(label);
     ImGui::BeginDisabled(enabled == 0);
-    const bool pressed = ImGui::Button(text.c_str(), ImVec2(width, height));
+    const bool pressed =
+        ImGui::Button(text.c_str(), PluginButtonSize(text, width, height));
     ImGui::EndDisabled();
     return enabled != 0 && pressed ? 1 : 0;
 }
@@ -630,7 +700,7 @@ ImGuiTabItemFlags ToImGuiTabItemFlags(const std::uint32_t flags) noexcept {
 int ANOMALY_CALL BeginTabBar(
     void*, AnomalyStringViewV1 id, const std::uint32_t flags) {
     const std::string text = Copy(id);
-    return ImGui::BeginTabBar(text.c_str(), ToImGuiTabBarFlags(flags)) ? 1 : 0;
+    return glass::BeginTabBar(text.c_str(), ToImGuiTabBarFlags(flags)) ? 1 : 0;
 }
 
 int ANOMALY_CALL BeginTabItem(
@@ -653,13 +723,15 @@ int ANOMALY_CALL BeginTabItem(
 
 void ANOMALY_CALL EndTabItem(void*) { ImGui::EndTabItem(); }
 
-void ANOMALY_CALL EndTabBar(void*) { ImGui::EndTabBar(); }
+void ANOMALY_CALL EndTabBar(void*) { glass::EndTabBar(); }
 
 int ANOMALY_CALL Checkbox(void*, AnomalyStringViewV1 label, int* value) {
     if (value == nullptr) return 0;
     const std::string text = Copy(label);
     bool checked = *value != 0;
-    const bool changed = ImGui::Checkbox(text.c_str(), &checked);
+    // Every boolean the plugin ABI exposes is a switch, so plugin pages match
+    // the shell without a new entry point.
+    const bool changed = glass::Switch(text.c_str(), &checked);
     *value = checked ? 1 : 0;
     return changed ? 1 : 0;
 }
@@ -669,7 +741,7 @@ int ANOMALY_CALL SliderFloat(
     if (value == nullptr || !std::isfinite(minimum) || !std::isfinite(maximum) ||
         minimum >= maximum) return 0;
     const std::string text = Copy(label);
-    return ImGui::SliderFloat(text.c_str(), value, minimum, maximum) ? 1 : 0;
+    return glass::SliderFloat(text.c_str(), value, minimum, maximum) ? 1 : 0;
 }
 
 int ANOMALY_CALL SliderFloatEnabled(
@@ -679,7 +751,7 @@ int ANOMALY_CALL SliderFloatEnabled(
         minimum >= maximum) return 0;
     const std::string text = Copy(label);
     ImGui::BeginDisabled(enabled == 0);
-    const bool changed = ImGui::SliderFloat(text.c_str(), value, minimum, maximum);
+    const bool changed = glass::SliderFloat(text.c_str(), value, minimum, maximum);
     ImGui::EndDisabled();
     return enabled != 0 && changed ? 1 : 0;
 }
