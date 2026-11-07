@@ -1288,7 +1288,7 @@ bool ReleaseGraphics(
             state.plugins->SetImGuiContext(nullptr);
         }
     }
-    RestoreEmbeddedInput(state);
+    if (!RestoreEmbeddedInput(state)) return false;
     anomaly::glass::ShutdownRenderer();
     if (state.dx12_initialized) {
         state.shader_descriptors.ReleaseReserved();
@@ -1495,7 +1495,10 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
                 phase_completed - phase_started);
             phase_started = phase_completed;
         }
-        state->plugins->Draw(ImGui::GetCurrentContext());
+        // No plugin draw while the first-launch notice is unanswered.
+        if (!anomaly::HostUiPluginDrawSuppressed()) {
+            state->plugins->Draw(ImGui::GetCurrentContext());
+        }
         if (sampled) {
             const auto phase_completed = std::chrono::steady_clock::now();
             state->performance.Record(

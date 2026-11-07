@@ -16,7 +16,7 @@ uint64_t equip_sent{};
 uintptr_t text_to_string{};
 Clock::time_point next_catalog{},next_stock{};
 std::filesystem::path bait_file;
-struct TableEntry {FName key;uintptr_t row;uint32_t hash,next;};
+struct TableEntry {FName key;uintptr_t row;uint32_t hash,next;}; // TMap<FName,uint8*> element: Row at +8.
 static_assert(sizeof(TableEntry)==24);
 struct CatalogBuild {
     AnomalyGenerationHandleV1 table{};
@@ -34,18 +34,19 @@ bool SparseElements(const Reader& r,uintptr_t address,size_t stride,int limit,st
        h.free_count<0 || h.free_count>h.count || (!h.extra_bits && h.count>128) || (h.count && !h.data)) return false;
     raw.resize(static_cast<size_t>(h.count)*stride);flags.resize((h.count+31)/32);
     if(h.count && (core->read_memory(core->user,h.data,{raw.data(),raw.size()}).code!=0 ||
-       core->read_memory(core->user,h.extra_bits?h.extra_bits:address+16,
+       core->read_memory(core->user,h.extra_bits?h.extra_bits:address+fishing::profile::native_layout.MapInlineBits,
            {reinterpret_cast<uint8_t*>(flags.data()),flags.size()*4}).code!=0)) return false;
     return true;
 }
 bool TableRows(const Reader& r,uintptr_t table,const char* type,std::vector<TableEntry>& rows) {
     uintptr_t row_type{};
-    if(!r.IsA(table,"DataTable") || !r.Read(table+0x28,row_type) || r.NameAt(row_type+24)!=type) return false;
+    // UDataTable::RowStruct at +0x28, UDataTable::RowMap at +0x30 with 24-byte sparse elements.
+    if(!r.IsA(table,"DataTable") || !r.Read(table+fishing::profile::native_layout.DataTableType,row_type) || r.NameAt(row_type + fishing::profile::native_layout.ObjectName)!=type) return false;
     std::vector<uint8_t> raw;std::vector<uint32_t> flags;
-    if(!SparseElements(r,table+0x30,24,8192,raw,flags)) return false;
+    if(!SparseElements(r,table+fishing::profile::native_layout.DataTableMap,fishing::profile::native_layout.RowStride,8192,raw,flags)) return false;
     rows.clear();
-    for(size_t i=0;i<raw.size()/24;++i) if(flags[i/32]&(1u<<(i%32))) {
-        TableEntry row{};std::memcpy(&row,raw.data()+i*24,24);
+    for(size_t i=0;i<raw.size()/fishing::profile::native_layout.RowStride;++i) if(flags[i/32]&(1u<<(i%32))) {
+        TableEntry row{};std::memcpy(&row,raw.data()+i*fishing::profile::native_layout.RowStride,sizeof(row));
         if(!row.key.id || !row.row) return false;rows.push_back(row);
     }
     return true;
@@ -57,11 +58,8 @@ uintptr_t InvokeTextString(uintptr_t function,uintptr_t text) {
 std::string BaitText(const Reader& r,uintptr_t address) {
     char cached[512]{};size_t length=sizeof(cached);
     if(names->resolve_ftext_utf8 && names->resolve_ftext_utf8(names->user,address,cached,&length).code==0 && cached[0]) return cached;
-    if(!text_to_string) {
-        const auto sig=Host(api).Query<AnomalySignatureServiceV1>(ANOMALY_SIGNATURE_SERVICE_V1_ID).get();
-        if(!sig || !sig->resolve || sig->resolve(sig->user,StringView("HTGame.exe"),StringView(".text"),
-            StringView(fishing::profile::TextToString),&text_to_string).code!=0) return {};
-    }
+    text_to_string=fishing::profile::compatibility.Address("TextToString");
+    if(!text_to_string) return {};
     // FText::ToString returns a borrowed FString reference; no returned allocation is owned here.
     const auto string=InvokeTextString(text_to_string,address);RowArray value{};
     if(!string || !r.Read(string,value) || !value.data || value.count<1 || value.count>512 || value.capacity<value.count) return {};
@@ -80,42 +78,49 @@ void UpdateBaitCatalog(const Reader& r) {
         uintptr_t gd{};if(!cdo || !get || !Invoke(r,cdo,get,&gd) || !r.IsA(gd,"HTGameData")) return;
         const auto fish=Child(r,gd,"FishingDataAsset"),bait=Child(r,fish,"StaticFishBaitDataTable"),goods=Child(r,gd,"GoodsDataTable");
         uintptr_t row_type{};
-        if(!goods || !r.Read(goods+0x28,row_type) || !r.Property(row_type,"OwnerShopID",0x28,8) ||
-           !r.Property(row_type,"ItemID",0x30,8) || !r.Property(row_type,"ItemName",0x38,16) ||
-           !r.Property(row_type,"CurrencyID",0x8C,8) || !r.Property(row_type,"Price",0x98,8)) return;
+        if(!goods || !r.Read(goods+fishing::profile::native_layout.DataTableType,row_type) || !r.Property(row_type,"OwnerShopID",fishing::profile::native_layout.GoodsShop,8) ||
+           !r.Property(row_type,"ItemID",fishing::profile::native_layout.GoodsItem,8) || !r.Property(row_type,"ItemName",fishing::profile::native_layout.GoodsName,16) ||
+           !r.Property(row_type,"CurrencyID",fishing::profile::native_layout.GoodsCurrency,8) || !r.Property(row_type,"Price",fishing::profile::native_layout.GoodsPrice,8)) return;
         // This asset stores bait rows as generic StaticItemData, with bait-specific
         // details in their extension payload. The property name is not its row type.
         uintptr_t bait_type{};
-        if(!bait || !r.Read(bait+0x28,bait_type) || !r.Property(bait_type,"ItemName",0xA0,16) ||
-           !r.Property(bait_type,"ItemType",8,1)) return;
+        if(!bait || !r.Read(bait+fishing::profile::native_layout.DataTableType,bait_type) || !r.Property(bait_type,"ItemName",fishing::profile::native_layout.ItemName,16) ||
+           !r.Property(bait_type,"ItemType",fishing::profile::native_layout.ItemType,1)) return;
         std::vector<TableEntry> baits,all;
         if(!TableRows(r,bait,"StaticItemData",baits) || !TableRows(r,goods,"GoodsData",all)) return;
         catalog_build={};catalog_build.table=Handle(r,goods);if(!catalog_build.table.id) return;
         catalog_build.goods=std::move(all);
-        for(auto entry:baits) {uint8_t type{};if(r.Read(entry.row+8,type) && type==42) catalog_build.baits[NameKey(entry.key)]=entry.row;}
+        // FStaticItemData.ItemType at +8; 42 is EItemType::ITEM_TYPE_FISH_BAIT.
+        for(auto entry:baits) {uint8_t type{};if(r.Read(entry.row+fishing::profile::native_layout.ItemType,type) && type==42) catalog_build.baits[NameKey(entry.key)]=entry.row;}
         next_catalog=now;
     }
     if(!Resolve(r,objects,catalog_build.table)) {catalog_build={};next_catalog=now+std::chrono::seconds(5);return;}
+    // GoodsDataTable rows are FGoodsData. Field names for the raw offsets below:
+    // +0x28 OwnerShopID, +0x30 ItemID, +0x38 ItemName, +0x8C CurrencyID, +0x98 Price,
+    // +0x58 MixAmount (per-purchase minimum), +0x60 MaxAmount, +0x68 MaxSelectorAmount.
     // Build in small batches; never scan the global object or name pools every frame.
     int found_this_tick=0;
     for(size_t end=std::min(catalog_build.cursor+128,catalog_build.goods.size());catalog_build.cursor<end;) {
         const auto entry=catalog_build.goods[catalog_build.cursor++];FName item{};
-        if(!r.Read(entry.row+0x30,item) || !catalog_build.baits.contains(NameKey(item))) continue;
+        if(!r.Read(entry.row+fishing::profile::native_layout.GoodsItem,item) || !catalog_build.baits.contains(NameKey(item))) continue;
         BaitOption option{};option.item=item;
-        if(!r.Read(entry.row+0x28,option.shop) || !r.Read(entry.row+0x8C,option.currency) ||
-           !r.Read(entry.row+0x98,option.price) || !r.Read(entry.row+0x58,option.minimum) ||
-           !r.Read(entry.row+0x60,option.maximum) || !option.shop.id || !option.currency.id || option.price<=0) continue;
-        int64_t selector{};r.Read(entry.row+0x68,selector);
+        if(!r.Read(entry.row+fishing::profile::native_layout.GoodsShop,option.shop) || !r.Read(entry.row+fishing::profile::native_layout.GoodsCurrency,option.currency) ||
+           !r.Read(entry.row+fishing::profile::native_layout.GoodsPrice,option.price) || !r.Read(entry.row+fishing::profile::native_layout.GoodsMinimum,option.minimum) ||
+           !r.Read(entry.row+fishing::profile::native_layout.GoodsMaximum,option.maximum) || !option.shop.id || !option.currency.id || option.price<=0) continue;
+        int64_t selector{};r.Read(entry.row+fishing::profile::native_layout.GoodsSelector,selector);
         option.maximum=selector>0?selector:999;option.minimum=std::max<int64_t>(1,option.minimum);
         option.maximum=std::clamp<int64_t>(option.maximum,option.minimum,9999);
-        option.goods=entry.key;option.key=r.Name(entry.key);option.label=BaitText(r,catalog_build.baits.at(NameKey(item))+0xA0);
-        if(option.label.empty()) option.label=BaitText(r,entry.row+0x38);
+        option.goods=entry.key;option.key=r.Name(entry.key);
+        option.label=BaitText(r,catalog_build.baits.at(NameKey(item))+fishing::profile::native_layout.ItemName); // FStaticItemData.ItemName
+        if(option.label.empty()) option.label=BaitText(r,entry.row+fishing::profile::native_layout.GoodsName); // FGoodsData.ItemName
         if(option.label.empty()) option.label=r.Name(item);
         const auto currency=r.Name(option.currency);
         // Only normal fishing currencies are offered, not charge or unrelated shop goods.
         if(currency!="Fons" && currency!="FishingCoin") continue;
-        option.currency_label=currency=="Fons"?"方斯":"钓鱼币";
-        option.label+="（"+std::to_string(option.price)+" "+option.currency_label+"/个）";
+        option.currency_label=currency=="Fons"?localizer.Text("currency.fons","Fons"):localizer.Text("currency.fishing_coin","Fishing Coin");
+        const auto price_text=std::to_string(option.price);
+        const std::array price_arguments{std::string_view(price_text),std::string_view(option.currency_label)};
+        option.label+=localizer.Format("bait.price_suffix"," ({0} {1} each)",price_arguments);
         catalog_build.found.push_back(std::move(option));if(++found_this_tick>=4) break;
     }
     if(catalog_build.cursor>=catalog_build.goods.size()) {
@@ -194,76 +199,98 @@ void RefreshBaitStock(const Reader& r,uintptr_t ps) {
 bool EnsureBait(const Reader& r,uintptr_t ps,uintptr_t util,uint64_t now) {
     const auto config=bait_settings.load();if(!config || !config->buy) return true;
     const auto get=Fn(r,"HTGame","HTPlayerState","GetEquipedFishBait",1,8);uintptr_t equipped{};
-    if(!get || !Invoke(r,ps,get,&equipped)) {Publish("正在读取已装备鱼饵。");return false;}
+    if(!get || !Invoke(r,ps,get,&equipped)) {Publish(localizer.Text("status.bait_equipped_reading","Reading the equipped bait."));return false;}
     int64_t available{};
     const auto amount_offset=equipped?Field(r,equipped,"Amount",8):-1;
     if(amount_offset>=0 && r.Read(equipped+amount_offset,available) && available>0) {
         equip_pending=false;restock.Retry();return true;
     }
     const auto list=bait_catalog.load();const auto option=list?SelectedBait(*config,*list):nullptr;
-    if(!option) {Publish(list?"请先选择补购鱼饵。":"正在读取鱼饵商店。");return false;}
+    if(!option) {Publish(list?
+        localizer.Text("status.bait_choose_first","Choose the bait to restock first."):
+        localizer.Text("status.bait_shop_reading","Reading the bait shop."));return false;}
     const auto inventory=Child(r,ps,"InventoryComponent");
     const auto& current=restock.pending?pending_bait:*option;
-    int64_t stock{};if(!ItemAmount(r,inventory,current.item,stock)) {Publish("正在读取鱼饵库存。");return false;}
+    int64_t stock{};if(!ItemAmount(r,inventory,current.item,stock)) {Publish(localizer.Text("status.bait_stock_reading","Reading the bait stock."));return false;}
     bait_stock=stock;
     if(restock.pending) {
         if(!restock.Received(stock)) {
-            if(restock.Expired(now)) {paused=true;Publish("鱼饵补购未到账，已暂停。请检查余额或购买限制，再重新开启。");}
-            else Publish("正在补购鱼饵，等待到账。");
+            if(restock.Expired(now)) {paused=true;Publish(localizer.Text("status.bait_restock_timeout","The bait restock did not arrive, so auto fishing paused. Check the balance or the purchase limit, then start it again."));}
+            else Publish(localizer.Text("status.bait_restock_waiting","Restocking bait; waiting for it to arrive."));
             return false;
         }
         Log("autofish bait received stock="+std::to_string(stock));next_stock={};
         if(!SameName(current.item,option->item)) return false;
     }
     if(stock==0) {
-        if(restock.failed) {paused=true;Publish("鱼饵补购已暂停，请关闭再开启自动钓鱼重试。");return false;}
-        if(config->quantity<option->minimum || config->quantity>option->maximum) {paused=true;Publish("购买数量超出该鱼饵可选范围。");return false;}
+        if(restock.failed) {paused=true;Publish(localizer.Text("status.bait_restock_paused","Bait restocking is paused. Toggle auto fishing off and on to retry."));return false;}
+        if(config->quantity<option->minimum || config->quantity>option->maximum) {paused=true;Publish(localizer.Text("status.bait_quantity_range","The purchase quantity is outside the allowed range for this bait."));return false;}
         int64_t cost{},balance{};
-        if(!fishing::PurchaseCost(option->price,config->quantity,cost) || !ItemAmount(r,inventory,option->currency,balance)) {Publish("正在读取购买价格和余额。");return false;}
-        if(balance<cost) {paused=true;restock.failed=true;Publish(option->currency_label+"不足，已暂停自动钓鱼。");return false;}
+        if(!fishing::PurchaseCost(option->price,config->quantity,cost) || !ItemAmount(r,inventory,option->currency,balance)) {Publish(localizer.Text("status.bait_price_reading","Reading the price and the balance."));return false;}
+        if(balance<cost) {
+            paused=true;restock.failed=true;
+            const std::array balance_arguments{std::string_view(option->currency_label)};
+            Publish(localizer.Format("status.bait_balance_low","{0} is insufficient, so auto fishing paused.",balance_arguments));
+            return false;
+        }
         const auto buy=Fn(r,"HTGame","HTPlayerState","ServerShopBuyGoods",5,48);
-        if(!buy) {paused=true;Publish("鱼饵购买接口暂不可用。");return false;}
+        if(!buy) {paused=true;Publish(localizer.Text("status.bait_buy_unavailable","The bait purchase interface is unavailable."));return false;}
         struct Purchase {FName shop,goods;int64_t amount;uint8_t popup{};uint8_t padding[3]{};uint8_t city[20]{};};
         static_assert(sizeof(Purchase)==48);
         Purchase request{option->shop,option->goods,config->quantity};pending_bait=*option;
-        if(!restock.Begin(now,stock) || !Invoke(r,ps,buy,&request)) {restock.pending=false;restock.failed=true;paused=true;Publish("鱼饵补购失败，已暂停。");return false;}
+        if(!restock.Begin(now,stock) || !Invoke(r,ps,buy,&request)) {restock.pending=false;restock.failed=true;paused=true;Publish(localizer.Text("status.bait_restock_failed","The bait restock failed, so auto fishing paused."));return false;}
         Log("autofish bait buy goods="+option->key+" quantity="+std::to_string(config->quantity));
-        Publish("正在补购鱼饵，等待到账。");return false;
+        Publish(localizer.Text("status.bait_restock_waiting","Restocking bait; waiting for it to arrive."));return false;
     }
     const auto id=equipped?Field(r,equipped,"ItemID",8):-1;FName equipped_id{};
     if(id>=0 && r.Read(equipped+id,equipped_id) && SameName(equipped_id,option->item)) {equip_pending=false;restock.Retry();return true;}
     if(equip_pending) {
-        if(now-equip_sent>=10000) {paused=true;Publish("鱼饵未能装备，已暂停。请检查所选鱼饵是否适用。");}
-        else Publish("正在装备所选鱼饵。");
+        if(now-equip_sent>=10000) {paused=true;Publish(localizer.Text("status.bait_equip_timeout","The bait could not be equipped, so auto fishing paused. Check that the selected bait applies."));}
+        else Publish(localizer.Text("status.bait_equipping","Equipping the selected bait."));
         return false;
     }
     const auto item=InventoryBait(r,inventory,util,option->item),equip=Fn(r,"HTGame","HTPlayerState","ServerEquipFishBait",1,8);
     uint64_t unique{};const auto unique_offset=item?Field(r,item,"UniqueID",8):-1;
-    if(!item || unique_offset<0 || !r.Read(item+unique_offset,unique) || !unique || !equip) {Publish("正在等待鱼饵库存更新。");return false;}
+    if(!item || unique_offset<0 || !r.Read(item+unique_offset,unique) || !unique || !equip) {Publish(localizer.Text("status.bait_stock_waiting","Waiting for the bait stock to update."));return false;}
     equip_pending=true;equip_sent=now;
-    if(!Invoke(r,ps,equip,&unique)) {equip_pending=false;paused=true;Publish("鱼饵装备失败，已暂停。");return false;}
-    Log("autofish bait equip item="+r.Name(option->item));Publish("正在装备所选鱼饵。");return false;
+    if(!Invoke(r,ps,equip,&unique)) {equip_pending=false;paused=true;Publish(localizer.Text("status.bait_equip_failed","Equipping the bait failed, so auto fishing paused."));return false;}
+    Log("autofish bait equip item="+r.Name(option->item));Publish(localizer.Text("status.bait_equipping","Equipping the selected bait."));return false;
 }
 void BaitContent(const AnomalyUiServiceV1* ui) {
     auto config=bait_settings.load();if(!config) return;
     auto changed=std::make_shared<BaitSettings>(*config);bool dirty=false;
     int buy=config->buy;
-    if(ui->checkbox(ui->user,StringView("鱼饵用完自动购买"),&buy)) {changed->buy=buy!=0;dirty=true;}
+    const auto buy_label=localizer.Text("option.bait_auto_buy","Buy bait automatically when it runs out");
+    if(ui->checkbox(ui->user,StringView(buy_label),&buy)) {changed->buy=buy!=0;dirty=true;}
     const auto list=bait_catalog.load();const auto option=list?SelectedBait(*config,*list):nullptr;
-    ui->text(ui->user,StringView(option?"所选："+option->label:"请选择补购鱼饵。"));
-    if(ui->begin_menu && ui->end_menu && ui->button && ui->begin_menu(ui->user,StringView("选择鱼饵"),list && !list->empty())) {
+    if(option) {
+        const std::array selected_arguments{std::string_view(option->label)};
+        const auto selected=localizer.Format("text.bait_selected","Selected: {0}",selected_arguments);
+        ui->text(ui->user,StringView(selected));
+    } else ui->text(ui->user,StringView(localizer.Text("text.bait_none","Choose the bait to restock.")));
+    const auto menu_label=localizer.Text("action.choose_bait","Choose bait");
+    if(ui->begin_menu && ui->end_menu && ui->button && ui->begin_menu(ui->user,StringView(menu_label),list && !list->empty())) {
         for(const auto& entry:*list) if(ui->button(ui->user,StringView(entry.label+"##"+entry.key),0,0)) {
             changed->goods=entry.key;changed->quantity=static_cast<uint32_t>(std::clamp<int64_t>(changed->quantity,entry.minimum,entry.maximum));dirty=true;
         }
         ui->end_menu(ui->user);
     }
     uint32_t quantity=config->quantity;
-    if(ui->input_uint32 && ui->input_uint32(ui->user,StringView("每次购买数量"),&quantity,1,10)) {
+    const auto quantity_label=localizer.Text("label.bait_quantity","Purchase quantity");
+    if(ui->input_uint32 && ui->input_uint32(ui->user,StringView(quantity_label),&quantity,1,10)) {
         changed->quantity=std::clamp<uint32_t>(quantity,option?static_cast<uint32_t>(option->minimum):1,option?static_cast<uint32_t>(option->maximum):9999);dirty=true;
     }
     int64_t total{};
-    if(option && fishing::PurchaseCost(option->price,changed->quantity,total)) ui->text(ui->user,StringView("每次花费："+std::to_string(total)+" "+option->currency_label));
-    if(bait_stock.load()>=0 && option) ui->text(ui->user,StringView("所选鱼饵库存："+std::to_string(bait_stock.load())));
-    if(buy) ui->text(ui->user,StringView("鱼饵用完后补购所选鱼饵，并自动装备。"));
+    if(option && fishing::PurchaseCost(option->price,changed->quantity,total)) {
+        const auto total_text=std::to_string(total);
+        const std::array cost_arguments{std::string_view(total_text),std::string_view(option->currency_label)};
+        ui->text(ui->user,StringView(localizer.Format("text.bait_cost","Cost per purchase: {0} {1}",cost_arguments)));
+    }
+    if(bait_stock.load()>=0 && option) {
+        const auto stock_text=std::to_string(bait_stock.load());
+        const std::array stock_arguments{std::string_view(stock_text)};
+        ui->text(ui->user,StringView(localizer.Format("text.bait_stock","Selected bait stock: {0}",stock_arguments)));
+    }
+    if(buy) ui->text(ui->user,StringView(localizer.Text("hint.bait_auto_buy","When the bait runs out, the selected bait is restocked and equipped automatically.")));
     if(dirty) {bait_stock=-1;bait_settings.store(changed);}
 }

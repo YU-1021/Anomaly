@@ -8,6 +8,7 @@
 #include "anomaly/platform_ui_model.hpp"
 #include "anomaly/platform_ui_input_policy.hpp"
 #include "anomaly/platform_ui_theme.hpp"
+#include "anomaly/platform_notice.hpp"
 #include "anomaly/plugin_scope.hpp"
 #include "anomaly/ui_resource_decoder.hpp"
 #include "anomaly/ui_resource_registry.hpp"
@@ -331,8 +332,7 @@ bool EnableHostWindowTransparency(HWND window) noexcept {
     return SUCCEEDED(result);
 }
 
-bool CreateDevice(HostWindow& host) {
-    DXGI_SWAP_CHAIN_DESC description{};
+bool CreateDevice(HostWindow& host) {    DXGI_SWAP_CHAIN_DESC description{};
     description.BufferCount = 2;
     description.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -1067,6 +1067,14 @@ public:
                 anomaly::ParseHostCatalog(anomaly::Locale::EnUs).translator;
         }
         anomaly::SetHostUiDeveloperMode(false);
+        // Read once, off the render thread.
+        if (auto document = anomaly::LoadNoticeDocument(diagnostics_.runtime_root,
+                anomaly::kFirstRunNoticeDocument,
+                anomaly::LocaleName(diagnostics_.translator->locale()),
+                anomaly::kPlatformNoticeVersion)) {
+            notice_document_ = std::make_shared<const anomaly::NoticeDocument>(
+                std::move(*document));
+        }
         // Keep route, tab and selection outside the renderer-owned ImGui
         // context so a device rebuild does not reset the management surface.
         model_.State() = std::move(state);
@@ -1548,6 +1556,8 @@ public:
     [[nodiscard]] ShutdownResult BeginShutdown(
         std::chrono::milliseconds drain_timeout = std::chrono::seconds(5)) {
         anomaly::SetHostUiDeveloperMode(false);
+        // A retired owner must not leave plugin drawing suppressed behind it.
+        anomaly::SetHostUiPluginDrawSuppressed(false);
         const auto bounded_timeout = (std::max)(drain_timeout, std::chrono::milliseconds::zero());
         const auto deadline = bounded_timeout == std::chrono::milliseconds::max()
             ? std::chrono::steady_clock::time_point::max()
@@ -1621,6 +1631,19 @@ public:
         std::scoped_lock operation_lock(operation_mutex_);
         RecordPerformance(
             PlatformUiPerformanceStage::OperationLockWait, phase_started);
+        // Set before the early returns: it must answer while the shell is closed.
+        const bool notice_pending = NoticeGateClosed();
+        anomaly::SetHostUiPluginDrawSuppressed(notice_pending);
+        // First sight of an unanswered notice: open the shell and take the mouse
+        // the way an expanded menu does, so the card is clickable without pressing
+        // the toggle key first. The key still hides and restores it.
+        if (notice_pending && !notice_revealed_) {
+            notice_revealed_ = true;
+            static_cast<void>(plugins_.UiResources().OpenWindow(
+                management_window_scope_, management_window_));
+            anomaly::SetHostUiMenusCollapsed(false);
+        }
+        const bool notice_visible = notice_pending && !anomaly::HostUiMenusCollapsed();
         phase_started = measure ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
         const auto window = plugins_.UiResources().WindowState(
@@ -1675,6 +1698,14 @@ public:
             logical_expanded_size.x * ui_scale, logical_expanded_size.y * ui_scale};
         expanded_size.x = std::clamp(expanded_size.x, minimum_shell_width, maximum_shell_width);
         expanded_size.y = std::clamp(expanded_size.y, minimum_shell_height, maximum_shell_height);
+        if (notice_pending) {
+            // Nothing of the shell is drawn, so the window shrinks to a point:
+            // it only has to be a parent for the card, and a shell-sized window
+            // would paint a compositor-blurred rectangle over the desktop.
+            ui->set_next_window_size_constraints(ui->user, 1.0f, 1.0f, 1.0f, 1.0f);
+            ui->set_next_window_size(
+                ui->user, 1.0f, 1.0f, static_cast<std::uint32_t>(ImGuiCond_Always));
+        }
         const bool globally_collapsed = ManagementShellGloballyCollapsed();
         const bool shell_collapsed = ManagementShellCollapsed();
         const bool restoring_from_collapse = management_shell_was_collapsed_ && !shell_collapsed;
@@ -1686,7 +1717,9 @@ public:
         ImGui::SetNextWindowPos(
             ImVec2(shell_margin, shell_margin),
             ImGuiCond_FirstUseEver);
-        if (globally_collapsed) {
+        if (notice_pending) {
+            // Sized above; the card is centred on the viewport, not on this.
+        } else if (globally_collapsed) {
             ui->set_next_window_size_constraints(
                 ui->user, shell_width, shell_height, shell_width, shell_height);
             ui->set_next_window_size(
@@ -1727,38 +1760,43 @@ public:
             const ImVec2 management_window_size = ImGui::GetWindowSize();
             management_shell_locked_ = anomaly::HostUiCurrentWindowLocked();
             UpdateLayout();
-            HandleShellShortcuts();
-            const bool shell_was_collapsed = ManagementShellCollapsed();
-            // Collapsing keeps the wallpaper: the strip is the entire window, so
-            // dropping the artwork as well left a hole in the game rather than a
-            // small copy of the custom background. The stickers still go, because a
-            // placement normalised against the expanded shell reads as noise in a
-            // strip this thin.
-            DrawThemeImages(
-                management_window_origin, management_window_size, false,
-                !shell_was_collapsed);
-            if (!shell_was_collapsed) {
-                // The second sticker pass also runs before the shell, so a sticker
-                // can paint over the wallpaper without ever landing on the text.
-                DrawThemeImages(management_window_origin, management_window_size, true);
+            // Unanswered: draw no shell, only the card.
+            if (!notice_pending) {
+                HandleShellShortcuts();
+                const bool shell_was_collapsed = ManagementShellCollapsed();
+                // Collapsing keeps the wallpaper: the strip is the entire window, so
+                // dropping the artwork as well left a hole in the game rather than a
+                // small copy of the custom background. The stickers still go, because a
+                // placement normalised against the expanded shell reads as noise in a
+                // strip this thin.
+                DrawThemeImages(
+                    management_window_origin, management_window_size, false,
+                    !shell_was_collapsed);
+                if (!shell_was_collapsed) {
+                    // The second sticker pass also runs before the shell, so a sticker
+                    // can paint over the wallpaper without ever landing on the text.
+                    DrawThemeImages(management_window_origin, management_window_size, true);
+                }
+                // Everything the shell's glass refracts is on screen now: the
+                // wallpaper, its veil and the stickers behind the panels.
+                anomaly::glass::CaptureBackdrop(ImGui::GetWindowDrawList());
+                RecordPerformance(PlatformUiPerformanceStage::FrameSetup, phase_started);
+                phase_started = measure ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
+                DrawManagementShell();
+                RecordPerformance(PlatformUiPerformanceStage::ManagementShell, phase_started);
+                phase_started = measure ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
+                if (!shell_was_collapsed && !ManagementShellCollapsed()) {
+                    DrawConfirmationPopup();
+                    DrawRepositoryUninstallPopup();
+                    DrawOperationDetailsPopup();
+                    DrawMemoryConfirmationPopup();
+                    DrawSettingsLeavePopup();
+                }
             }
-            // Everything the shell's glass refracts is on screen now: the
-            // wallpaper, its veil and the stickers behind the panels.
-            anomaly::glass::CaptureBackdrop(ImGui::GetWindowDrawList());
-            RecordPerformance(PlatformUiPerformanceStage::FrameSetup, phase_started);
-            phase_started = measure ? std::chrono::steady_clock::now()
-                                    : std::chrono::steady_clock::time_point{};
-            DrawManagementShell();
-            RecordPerformance(PlatformUiPerformanceStage::ManagementShell, phase_started);
-            phase_started = measure ? std::chrono::steady_clock::now()
-                                    : std::chrono::steady_clock::time_point{};
-            if (!shell_was_collapsed && !ManagementShellCollapsed()) {
-                DrawConfirmationPopup();
-                DrawRepositoryUninstallPopup();
-                DrawOperationDetailsPopup();
-                DrawMemoryConfirmationPopup();
-                DrawSettingsLeavePopup();
-            }
+            // Outside the shell guard: the notice is the only surface meanwhile.
+            DrawFirstRunNoticePopup(notice_visible);
             DrawStatusToast(management_window_origin, management_window_size);
             RecordPerformance(PlatformUiPerformanceStage::Popups, phase_started);
             phase_started = measure ? std::chrono::steady_clock::now()
@@ -2236,6 +2274,12 @@ private:
     struct SettingsApplyMailbox final {
         std::mutex mutex;
         std::optional<anomaly::PlatformSettingsApplyResult> result;
+    };
+
+    // Notice acceptance write result, filled by the lifecycle domain.
+    struct NoticeAcceptMailbox final {
+        std::mutex mutex;
+        std::optional<bool> result;
     };
 
     struct RepositoryConfigureResult final {
@@ -2755,6 +2799,11 @@ private:
             }
         }
 
+        if (notice_accept_mailbox_ != nullptr) {
+            std::scoped_lock lock(notice_accept_mailbox_->mutex);
+            notice_accept_mailbox_->result.reset();
+        }
+
         if (repository_configure_mailbox_ != nullptr) {
             std::optional<RepositoryConfigureResult> result;
             {
@@ -3066,6 +3115,29 @@ private:
         return management_shell_collapsed_ || ManagementShellGloballyCollapsed();
     }
 
+    // Reads the store, not the cached draft: it answers while the shell is closed.
+    [[nodiscard]] bool NoticeGateClosed() const {
+        if (notice_accepted_) return false;
+        const anomaly::PlatformSettingsSnapshot published = diagnostics_.settings_snapshot
+            ? diagnostics_.settings_snapshot() : settings_snapshot_;
+        return published.ready &&
+            published.values.interface_notice_accepted_version <
+                anomaly::kPlatformNoticeVersion;
+    }
+
+    void CloseManagementShell() {
+        if (plugins_.UiResources().CloseWindow(management_window_scope_, management_window_)) {
+            anomaly::SetHostUiMenusCollapsed(true);
+        }
+    }
+
+    void AcceptNotice() {
+        notice_accepted_ = true;
+        notice_accept_pending_ = anomaly::kPlatformNoticeVersion;
+        status_ = Text(anomaly::MessageId::NoticeWelcome);
+        status_failure_ = false;
+    }
+
     // The floating tab bar at the bottom of the shell. Items are equal width
     // and laid out inside the bar with a fixed inset; the selection lens and
     // the bar share one centre of curvature, so their corners stay concentric.
@@ -3120,6 +3192,22 @@ private:
     }
 
     static constexpr ImVec4 kClear{0.0f, 0.0f, 0.0f, 0.0f};
+
+    // The first-run card floats on the game frame instead of the themed shell and
+    // carries its own light pane (see DrawFirstRunNoticePopup), so it names its
+    // inks here: near-black body type, a golden yellow for a caution callout with
+    // the bright yellow rule that marks it, and blue links. A caution is set in
+    // the deeper gold rather than in the pure yellow of its rule, which would
+    // have almost no contrast on a pale face. The pane tint is the cream the
+    // plugin windows over the game already wear, so the card and those windows
+    // read as the same material.
+    static constexpr ImVec4 kNoticePaneTint{1.000f, 0.989f, 0.954f, 1.0f};
+    static constexpr ImVec4 kNoticeInk{0.106f, 0.110f, 0.122f, 1.0f};
+    static constexpr ImVec4 kNoticeMutedInk{0.361f, 0.373f, 0.400f, 1.0f};
+    static constexpr ImVec4 kNoticeCautionInk{0.620f, 0.412f, 0.020f, 1.0f};
+    static constexpr ImVec4 kNoticeCautionMark{0.949f, 0.718f, 0.020f, 1.0f};
+    static constexpr ImVec4 kNoticeLinkInk{0.078f, 0.404f, 0.784f, 1.0f};
+    static constexpr ImVec4 kNoticeDangerInk{0.702f, 0.149f, 0.118f, 1.0f};
 
     // Buttons are continuous rounded rectangles whose radius follows their
     // height, the proportion Apple's controls use.
@@ -3677,10 +3765,7 @@ private:
         ImGui::SameLine(0.0f, Scaled(4.0f));
         if (DrawShellHeaderControl("##shell-close", ShellHeaderControl::Close,
                 false, false, Text(anomaly::MessageId::ShellClose))) {
-            if (plugins_.UiResources().CloseWindow(
-                    management_window_scope_, management_window_)) {
-                anomaly::SetHostUiMenusCollapsed(true);
-            }
+            CloseManagementShell();
         }
     }
 
@@ -6771,6 +6856,242 @@ private:
         ImGui::EndPopup();
     }
 
+    // Faux bold: the run drawn twice, skipped when it wrapped.
+    void DrawNoticeEmphasis(const std::string& text) const {
+        ImGui::TextUnformatted(text.c_str());
+        if (ImGui::GetItemRectSize().y > ImGui::GetTextLineHeight() * 1.6f) return;
+        const ImVec2 origin = ImGui::GetItemRectMin();
+        ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+            ImVec2(origin.x + std::max(0.5f, Scaled(0.5f)), origin.y),
+            ImGui::GetColorU32(ImGuiCol_Text), text.c_str());
+    }
+
+    // One line sequence, so emphasis and links stay inside the sentence.
+    void DrawNoticeRuns(const std::vector<anomaly::NoticeRun>& runs) {
+        ImGui::PushTextWrapPos(0.0f);
+        for (std::size_t index = 0; index < runs.size(); ++index) {
+            if (index > 0) ImGui::SameLine(0.0f, 0.0f);
+            const anomaly::NoticeRun& run = runs[index];
+            switch (run.style) {
+            case anomaly::NoticeRunStyle::Text:
+                ImGui::TextUnformatted(run.text.c_str());
+                break;
+            case anomaly::NoticeRunStyle::Emphasis:
+                DrawNoticeEmphasis(run.text);
+                break;
+            case anomaly::NoticeRunStyle::Code:
+                ImGui::TextColored(kNoticeMutedInk, "%s", run.text.c_str());
+                break;
+            case anomaly::NoticeRunStyle::Link:
+                ImGui::PushStyleColor(ImGuiCol_Text, kNoticeLinkInk);
+                ImGui::TextUnformatted(run.text.c_str());
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    ImGui::SetTooltip("%s", run.url.c_str());
+                }
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    pending_external_url_ = run.url;
+                }
+                break;
+            }
+        }
+        ImGui::PopTextWrapPos();
+    }
+
+    // Draws the Markdown subset; unknown kinds fall back to a paragraph.
+    void DrawNoticeDocument(const anomaly::NoticeDocument& document) {
+        // Baked tiers, not window scaling: scaling a baked atlas blurs the glyphs.
+        const float ui_scale = PlatformUiScale();
+        ImFont* const body_font = ue5mem::PlatformUiFontForScale(ui_scale * 1.12f);
+        ImFont* const heading_font = ue5mem::PlatformUiFontForScale(ui_scale * 1.55f);
+        ImFont* const subheading_font = ue5mem::PlatformUiFontForScale(ui_scale * 1.28f);
+        const auto draw_block = [&](const anomaly::NoticeBlock& block) {
+            ImFont* font = body_font;
+            if (block.kind == anomaly::NoticeBlockKind::Heading) font = heading_font;
+            else if (block.kind == anomaly::NoticeBlockKind::Subheading) font = subheading_font;
+            const bool pushed = font != nullptr;
+            if (pushed) ImGui::PushFont(font);
+            switch (block.kind) {
+            case anomaly::NoticeBlockKind::Heading:
+                DrawNoticeRuns(block.runs);
+                ImGui::Spacing();
+                break;
+            case anomaly::NoticeBlockKind::Subheading:
+                DrawNoticeRuns(block.runs);
+                ImGui::Spacing();
+                break;
+            case anomaly::NoticeBlockKind::Paragraph:
+                DrawNoticeRuns(block.runs);
+                ImGui::Spacing();
+                break;
+            case anomaly::NoticeBlockKind::Bullet:
+                ImGui::Bullet();
+                ImGui::SameLine();
+                DrawNoticeRuns(block.runs);
+                ImGui::Spacing();
+                break;
+            case anomaly::NoticeBlockKind::Numbered:
+                ImGui::TextUnformatted(block.marker.c_str());
+                ImGui::SameLine();
+                DrawNoticeRuns(block.runs);
+                ImGui::Spacing();
+                break;
+            case anomaly::NoticeBlockKind::Separator:
+                ImGui::Separator();
+                break;
+            }
+            if (pushed) ImGui::PopFont();
+        };
+        for (const anomaly::NoticeBlock& block : document.blocks) {
+            if (block.alert == anomaly::NoticeAlert::None) {
+                draw_block(block);
+                continue;
+            }
+            // Alert lines are indented and carry a rule, so consecutive blocks
+            // read as one callout. A caution or warning is the one thing on the
+            // card that must be impossible to skim past, so it is set in gold and
+            // marked with the bright yellow rule; the informational alerts keep
+            // the body ink and only mark themselves with a muted rule.
+            const bool severe = block.alert == anomaly::NoticeAlert::Caution ||
+                block.alert == anomaly::NoticeAlert::Warning;
+            const ImVec4 alert_ink = severe ? kNoticeCautionInk : kNoticeInk;
+            const float indent = Scaled(14.0f);
+            const ImVec2 start = ImGui::GetCursorScreenPos();
+            ImGui::PushStyleColor(ImGuiCol_Text, alert_ink);
+            ImGui::Indent(indent);
+            draw_block(block);
+            ImGui::Unindent(indent);
+            ImGui::PopStyleColor();
+            const ImVec2 end = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                ImVec2(start.x, start.y - Scaled(2.0f)),
+                ImVec2(start.x + Scaled(3.0f), end.y - Scaled(4.0f)),
+                ImGui::GetColorU32(severe ? kNoticeCautionMark : kNoticeMutedInk),
+                Scaled(1.5f));
+        }
+    }
+
+    // First-launch gate: modal, no close button, no Escape.
+    void DrawFirstRunNoticePopup(const bool pending) {
+        if (!pending) {
+            notice_popup_opened_ = false;
+            return;
+        }
+        // Id is not localized; the document heading is the title.
+        constexpr const char* kNoticePopupId = "first-run-notice";
+        if (!notice_popup_opened_) {
+            ImGui::OpenPopup(kNoticePopupId);
+            notice_popup_opened_ = true;
+        }
+        // Sized against the viewport, not the shell: while the notice stands the
+        // shell window is a 1x1 stub.
+        const ImVec2 viewport_size = ImGui::GetMainViewport()->Size;
+        const float modal_width = std::min(
+            Scaled(700.0f), std::max(Scaled(360.0f), viewport_size.x - Scaled(48.0f)));
+        const float modal_height = std::min(
+            Scaled(620.0f), std::max(Scaled(320.0f), viewport_size.y - Scaled(56.0f)));
+        ImGui::SetNextWindowSize(ImVec2(modal_width, modal_height), ImGuiCond_Appearing);
+        // Centred on the viewport: there is no shell to anchor to.
+        const ImGuiViewport* const viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(
+            ImVec2(viewport->Pos.x + viewport->Size.x * 0.5f,
+                viewport->Pos.y + viewport->Size.y * 0.5f),
+            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        // No Escape handling and no close button.
+        if (!ImGui::BeginPopupModal(kNoticePopupId, nullptr,
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+                    // Only the body scrolls; the footer stays put.
+                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+            return;
+        }
+        // The card floats on the game frame, with no themed shell behind it to
+        // carry the palette's ink, so it names its own pane. The options below
+        // are this card's alone -- an own copy of SurfaceOptions handed to
+        // RegisterWindowSurface, exactly as a plugin window does it -- so the
+        // shell's surfaces and the plugin windows keep resolving theirs and are
+        // untouched. The material matches a plugin window over the game (deep
+        // backdrop, heavy face, soft rim, and the variant's own saturation); only
+        // the veil is a few points stronger, because near-black type needs a
+        // paler face than a dark-ink window does.
+        anomaly::glass::SurfaceOptions surface;
+        surface.variant = anomaly::glass::Variant::Regular;
+        surface.rounding = ImGui::GetStyle().PopupRounding;
+        surface.scale = ImGui::GetIO().FontGlobalScale > 0.0f
+            ? ImGui::GetIO().FontGlobalScale : 1.0f;
+        surface.clip = false;
+        surface.shadow = true;
+        surface.tint = kNoticePaneTint;
+        surface.tint_strength = 0.56f;
+        surface.face_blur = 2.0f;
+        surface.rim_blur = 1.7f;
+        surface.deep_backdrop = true;
+        anomaly::glass::RegisterWindowSurface(surface);
+        ImGui::PushStyleColor(ImGuiCol_Text, kNoticeInk);
+        const float footer_height = Scaled(104.0f);
+        const float body_height = std::max(
+            Scaled(110.0f), ImGui::GetContentRegionAvail().y - footer_height);
+        ImGui::BeginChild("FirstRunNoticeBody", ImVec2(0.0f, body_height), false);
+        if (notice_document_ != nullptr) {
+            DrawNoticeDocument(*notice_document_);
+        } else {
+            // Missing document: show the expected path, keep the gate closed.
+            ImGui::TextColored(kNoticeDangerInk, "!  %s",
+                anomaly::NoticeDocumentPath(diagnostics_.runtime_root,
+                    anomaly::kFirstRunNoticeDocument,
+                    anomaly::LocaleName(diagnostics_.translator->locale()))
+                    .string().c_str());
+        }
+        ImGui::EndChild();
+        ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.0f, 0.0f, 0.0f, 0.14f));
+        ImGui::Separator();
+        ImGui::PopStyleColor();
+        ImFont* const footer_font =
+            ue5mem::PlatformUiFontForScale(PlatformUiScale() * 1.12f);
+        const bool footer_pushed = footer_font != nullptr;
+        if (footer_pushed) ImGui::PushFont(footer_font);
+        const std::string agree = StableLabel(
+            anomaly::MessageId::NoticeAgree, "first-run-notice-agree");
+        anomaly::glass::Switch(agree.c_str(), &notice_agreed_);
+        const std::string exit_label =
+            StableLabel(anomaly::MessageId::NoticeExit, "first-run-notice-exit");
+        const std::string confirm_label =
+            StableLabel(anomaly::MessageId::NoticeConfirm, "first-run-notice-confirm");
+        const float button_height = Scaled(32.0f);
+        const float frame_padding = ImGui::GetStyle().FramePadding.x * 2.0f;
+        const float exit_width = ImGui::CalcTextSize(exit_label.c_str()).x + frame_padding;
+        const float confirm_width = ImGui::CalcTextSize(confirm_label.c_str()).x + frame_padding;
+        const float footer_width =
+            exit_width + ImGui::GetStyle().ItemSpacing.x + confirm_width;
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
+            ImGui::GetWindowContentRegionMax().x - footer_width));
+        // A secondary button needs a fill of its own: the themed button ink is a
+        // dark low-alpha wash tuned for the shell's own veil, which the deep blur
+        // of this pane eats.
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.07f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.12f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.0f, 0.0f, 0.0f, 0.18f));
+        if (ImGui::Button(exit_label.c_str(), ImVec2(exit_width, button_height))) {
+            notice_agreed_ = false;
+            notice_popup_opened_ = false;
+            ImGui::CloseCurrentPopup();
+            CloseManagementShell();
+        }
+        ImGui::PopStyleColor(3);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!notice_agreed_);
+        if (PrimaryButton(confirm_label.c_str(), ImVec2(confirm_width, button_height))) {
+            AcceptNotice();
+            notice_popup_opened_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndDisabled();
+        if (footer_pushed) ImGui::PopFont();
+        ImGui::PopStyleColor();
+        ImGui::EndPopup();
+    }
+
     void DrawSettingsShell() {
         const std::string subtitle = settings_snapshot_.ready
             ? std::string{}
@@ -7690,12 +8011,14 @@ private:
         std::optional<anomaly::PluginRepositoryConfig> repository_configure;
         std::optional<std::string> route;
         std::optional<std::string> external_url;
+        std::optional<std::uint32_t> notice_version;
         {
             std::scoped_lock operation_lock(operation_mutex_);
             apply.swap(pending_settings_apply_);
             repository_configure.swap(pending_repository_configure_);
             route.swap(settings_route_to_record_);
             external_url.swap(pending_external_url_);
+            notice_version.swap(notice_accept_pending_);
         }
         if (!external_url) external_url = anomaly::ConsumeHostUiExternalUrlRequest();
         const auto submit = diagnostics_.lifecycle_post
@@ -7750,6 +8073,23 @@ private:
                 std::scoped_lock lock(mailbox->mutex);
                 mailbox->result = RepositoryConfigureResult{
                     *repository_configure, std::move(submission)};
+            }
+        }
+        if (notice_version) {
+            // File I/O goes through the lifecycle domain and reports via the mailbox.
+            const auto mailbox = notice_accept_mailbox_;
+            const auto provider = diagnostics_.settings_record_notice;
+            const auto operation = [mailbox, provider, version = *notice_version] {
+                const bool stored = provider ? provider(version) : false;
+                std::scoped_lock lock(mailbox->mutex);
+                mailbox->result = stored;
+            };
+            std::uint32_t error = ERROR_SUCCESS;
+            if (submit) error = submit(operation);
+            else operation();
+            if (error != ERROR_SUCCESS) {
+                std::scoped_lock lock(mailbox->mutex);
+                mailbox->result = false;
             }
         }
         if (route && diagnostics_.settings_record_route) {
@@ -8356,6 +8696,16 @@ private:
     std::string settings_apply_error_;
     bool settings_save_pending_{};
     bool settings_route_restored_{};
+    // Accepted is process-local; the persisted value decides the next launch.
+    bool notice_accepted_{};
+    bool notice_agreed_{};
+    bool notice_popup_opened_{};
+    bool notice_revealed_{};
+    // Notice document; null when the installation is missing it.
+    std::shared_ptr<const anomaly::NoticeDocument> notice_document_;
+    std::optional<std::uint32_t> notice_accept_pending_;
+    std::shared_ptr<NoticeAcceptMailbox> notice_accept_mailbox_{
+        std::make_shared<NoticeAcceptMailbox>()};
     std::optional<std::string> pending_external_url_;
     bool settings_hotkey_capture_{};
     std::array<bool, 256> settings_hotkey_down_{};
@@ -9028,7 +9378,10 @@ void RunPlatform(
         {
             std::scoped_lock lock(*plugin_mutex);
             DrawPlatformUi();
-            plugins.Draw(ImGui::GetCurrentContext());
+            // No plugin draw before the notice is accepted.
+            if (!anomaly::HostUiPluginDrawSuppressed()) {
+                plugins.Draw(ImGui::GetCurrentContext());
+            }
         }
         ImGui::Render();
         UpdateHostWindowRegion(host);

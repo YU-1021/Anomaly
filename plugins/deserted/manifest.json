@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "id": "anomaly.builtin.nte.deserted",
+  "id": "wawmew.deserted",
   "name": "Deserted",
-  "description": "空无一人：勾选后，人流和车流都不再生成，但不影响站桩NPC",
+  "description": "Deserted: once enabled, crowd and vehicle spawning stops, without affecting the stationary NPCs.",
   "author": "WawMew",
   "license": "AGPL-3.0-only",
   "version": "0.6.3",
@@ -22,6 +22,10 @@
   "services": [
     {
       "id": "anomaly.ui",
+      "minVersion": 1
+    },
+    {
+      "id": "anomaly.localization",
       "minVersion": 1
     },
     {
@@ -58,6 +62,14 @@
       "id": "anomaly.scheduler",
       "minVersion": 1,
       "optional": true
+    },
+    {
+      "id": "anomaly.profile",
+      "minVersion": 1
+    },
+    {
+      "id": "anomaly.json",
+      "minVersion": 1
     }
   ],
   "capabilities": [
@@ -69,6 +81,7 @@
     "ue5-objects",
     "input",
     "storage",
-    "scheduler"
+    "scheduler",
+    "json"
   ]
 }

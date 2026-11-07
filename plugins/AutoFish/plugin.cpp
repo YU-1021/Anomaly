@@ -17,6 +17,7 @@
 #include <vector>
 #include <set>
 #include <limits>
+#include "anomaly/sdk/localization.hpp"
 #include "profile.hpp"
 #include "access.hpp"
 #include "flow.hpp"
@@ -27,6 +28,7 @@
 #include "persistence.hpp"
 
 namespace {
+anomaly::sdk::Localizer localizer;
 const AnomalyUe5NamesServiceV1* names{};
 const AnomalyUe5ObjectsServiceV1* objects{};
 const AnomalyUe5FrameworkServiceV1* framework{};
@@ -72,7 +74,7 @@ fishing::Persistence persisted_files;
 void Publish(std::string value) {status.store(std::make_shared<const std::string>(std::move(value)));}
 void ANOMALY_CALL Observe(void*,uintptr_t object,uintptr_t fn,void* parameters) {
     if(object!=observed_ps.load() && object!=observed_ui.load()) return;
-    const Reader r{names};const auto label=r.NameAt(fn+24);
+    const Reader r{names};const auto label=r.NameAt(fn + fishing::profile::native_layout.ObjectName);
     if(label.find("Fish")==std::string::npos && label.find("Throw")==std::string::npos &&
        label.find("Handle")==std::string::npos && label.find("Pressed")==std::string::npos) return;
     const auto phase=fishing::EventPhase(label);if(phase>=0) event_phase=phase;
@@ -80,7 +82,7 @@ void ANOMALY_CALL Observe(void*,uintptr_t object,uintptr_t fn,void* parameters) 
     if(label=="Client_ThrowUpResult") {
         result_pending=true;result_time=Clock::now();++result_serial;skipped_close={};result_success=false;
         if(parameters && r.Function(fn,label,2,36)) result_success=*static_cast<uint8_t*>(parameters)!=0;
-        if(enabled.load() && !result_success) {paused=true;Publish("本轮钓鱼失败，已暂停。请检查鱼线耐久后重新开启。");}
+        if(enabled.load() && !result_success) {paused=true;Publish(localizer.Text("status.cast_failed","This cast failed and auto fishing is paused. Check the line durability, then start it again."));}
         Log(std::string("autofish result success=")+(result_success?"1":"0"));
     }
     if(label=="Server_TryExitFishingState") result_pending=false;
@@ -114,21 +116,21 @@ uintptr_t Fn(const Reader& r,const char* package,const char* owner,const char* n
     return f && r.Function(f,name,static_cast<uint8_t>(count),static_cast<uint16_t>(size))?f:0;
 }
 int Field(const Reader& r,uintptr_t object,const char* name,int size) {
-    uintptr_t cls{};if(!r.Read(object+16,cls)) return -1;
+    uintptr_t cls{};if(!r.Read(object + fishing::profile::native_layout.ObjectClass,cls)) return -1;
     const auto key=std::to_string(cls)+":"+name+":"+std::to_string(size);
     const auto cached=offsets.find(key);if(cached!=offsets.end()) return cached->second;
     int found=-1;
     for(int depth=0;cls && depth<32;++depth) {
-        uintptr_t p{};if(!r.Read(cls+112,p)) break;
+        uintptr_t p{};if(!r.Read(cls + fishing::profile::native_layout.StructProperties,p)) break;
         for(int i=0;p && i<2048;++i) {
-            if(r.NameAt(p+32)==name) {
+            if(r.NameAt(p + fishing::profile::native_layout.PropertyName)==name) {
                 int bytes{},offset{};
-                if(r.Read(p+52,bytes) && bytes==size && r.Read(p+68,offset) && offset>=0 && offset<0x20000) found=offset;
+                if(r.Read(p + fishing::profile::native_layout.PropertySize,bytes) && bytes==size && r.Read(p + fishing::profile::native_layout.PropertyOffset,offset) && offset>=0 && offset<0x20000) found=offset;
                 break;
             }
-            if(!r.Read(p+72,p)) break;
+            if(!r.Read(p + fishing::profile::native_layout.PropertyNext,p)) break;
         }
-        if(found>=0 || !r.Read(cls+64,cls)) break;
+        if(found>=0 || !r.Read(cls + fishing::profile::native_layout.StructSuper,cls)) break;
     }
     offsets[key]=found;return found;
 }
@@ -138,16 +140,15 @@ uintptr_t Child(const Reader& r,uintptr_t parent,const char* field) {
 }
 AnomalyGenerationHandleV1 Handle(const Reader& r,uintptr_t address) {
     int index{};AnomalyUe5ObjectSnapshotV1 snapshot{sizeof(snapshot)};
-    if(!r.Read(address+12,index) || index<0 || objects->snapshot_at(objects->user,index,&snapshot).code!=0 ||
+    if(!r.Read(address + fishing::profile::native_layout.ObjectIndex,index) || index<0 || objects->snapshot_at(objects->user,index,&snapshot).code!=0 ||
        Resolve(r,objects,snapshot.handle)!=address) return {};
     return snapshot.handle;
 }
 uintptr_t World(const Reader& r) {
     if(!world_slot) {
-        const auto sig=Host(api).Query<AnomalySignatureServiceV1>(ANOMALY_SIGNATURE_SERVICE_V1_ID).get();
-        uintptr_t instruction{};int32_t displacement{};
-        if(!sig || sig->resolve(sig->user,StringView("HTGame.exe"),StringView(".text"),
-           StringView(fishing::profile::World),&instruction).code!=0 || !r.Read(instruction+3,displacement)) return 0;
+        const auto instruction=fishing::profile::compatibility.Address("World");
+        int32_t displacement{};
+        if(!instruction || !r.Read(instruction+3,displacement)) return 0;
         world_slot=static_cast<uintptr_t>(static_cast<intptr_t>(instruction)+7+displacement);
     }
     uintptr_t value{};return r.Read(world_slot,value) && r.IsA(value,"World")?value:0;
@@ -159,8 +160,8 @@ bool ActiveWidget(const Reader& r,uintptr_t widget) {
 }
 bool ClassDerives(const Reader& r,uintptr_t type,const char* base) {
     for(int depth=0;type && depth<32;++depth) {
-        if(r.NameAt(type+24)==base) return true;
-        if(!r.Read(type+64,type)) break;
+        if(r.NameAt(type + fishing::profile::native_layout.ObjectName)==base) return true;
+        if(!r.Read(type + fishing::profile::native_layout.StructSuper,type)) break;
     }
     return false;
 }
@@ -179,7 +180,7 @@ void ReadHudWidgets(const Reader& r,uintptr_t world,uintptr_t util) {
         else allocated=map.inline_bits[i/32];
         if(!(allocated&(1u<<(i%32)))) continue;
         uintptr_t type{};FName key{};
-        if(!r.Read(map.data+24*i,type) || !type || !r.Read(map.data+24*i+8,key)) continue;
+        if(!r.Read(map.data+fishing::profile::native_layout.MapEntryStride*i,type) || !type || !r.Read(map.data+fishing::profile::native_layout.MapEntryStride*i+fishing::profile::native_layout.MapValue,key)) continue;
         const bool main=ClassDerives(r,type,"HTUI_FishMain"),result=ClassDerives(r,type,"HTUI_FishingSuccess");
         if(!main && !result) continue;
         const auto label=r.Name(key);if(label.empty() || label.size()>128) continue;
@@ -208,14 +209,9 @@ bool InvokeRodUpdate(uintptr_t function,uintptr_t widget,int direction,float del
     __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
 }
 bool LockRod(const Reader& r,uintptr_t widget,double fish,double rod) {
-    if(!rod_update && Clock::now()>=next_rod_bind) {
-        next_rod_bind=Clock::now()+std::chrono::seconds(5);
-        const auto sig=Host(api).Query<AnomalySignatureServiceV1>(ANOMALY_SIGNATURE_SERVICE_V1_ID).get();
-        if(sig && sig->resolve) sig->resolve(sig->user,StringView("HTGame.exe"),StringView(".text"),
-            StringView(fishing::profile::RodUpdate),&rod_update);
-    }
+    rod_update=fishing::profile::compatibility.Address("RodUpdate");
     const auto offset=Field(r,widget,"RodSpeed",4);float speed{};
-    if(!rod_update || offset!=fishing::profile::RodSpeedOffset || !r.Read(widget+offset,speed) || speed<=0 || !std::isfinite(speed)) return false;
+    if(!rod_update || offset!=fishing::profile::native_layout.RodSpeedOffset || !r.Read(widget+offset,speed) || speed<=0 || !std::isfinite(speed)) return false;
     const auto now=Clock::now();const float elapsed=last_rod_update.time_since_epoch().count()?std::chrono::duration<float>(now-last_rod_update).count():0.02F;
     last_rod_update=now;
     const auto delta=fishing::LockDelta(fish,rod,speed,elapsed);
@@ -253,11 +249,11 @@ void SkipFishingCinematic(const Reader& r,uintptr_t ps) {
     uintptr_t asset{};if(!cdo || !get || !Invoke(r,cdo,get,&asset) || !r.IsA(asset,"FishingDataAsset")) return;
     // Match both the asset name and package to the game's fishing-success assets.
     // Other cutscenes owned by the player state must never be shortened.
-    const auto sequence_name=r.NameAt(sequence+24);uintptr_t outer{};r.Read(sequence+32,outer);
-    const auto package=r.NameAt(outer+24);bool match=false;
+    const auto sequence_name=r.NameAt(sequence + fishing::profile::native_layout.ObjectName);uintptr_t outer{};r.Read(sequence+fishing::profile::native_layout.ObjectOuter,outer);
+    const auto package=r.NameAt(outer + fishing::profile::native_layout.ObjectName);bool match=false;
     for(const auto field:{"FemaleFishingSuccessSequence","MaleFishingSuccessSequence"}) {
         const auto offset=Field(r,asset,field,40);
-        if(offset>=0 && sequence_name==r.NameAt(asset+offset+16) && package==r.NameAt(asset+offset+8)) match=true;
+        if(offset>=0 && sequence_name==r.NameAt(asset+offset+fishing::profile::native_layout.SoftAssetName) && package==r.NameAt(asset+offset+fishing::profile::native_layout.SoftPackageName)) match=true;
     }
     if(!match) return;
     const auto playing=Fn(r,"MovieScene","MovieSceneSequencePlayer","IsPlaying",1,1);
@@ -295,11 +291,8 @@ bool ContinueFishing(const Reader& r,uintptr_t widget) {
         struct Playing {uintptr_t animation;uint8_t active;} query{intro,0};
         if(!playing || !Invoke(r,widget,playing,&query) || query.active) return false;
     }
-    if(!catch_continue) {
-        const auto sig=Host(api).Query<AnomalySignatureServiceV1>(ANOMALY_SIGNATURE_SERVICE_V1_ID).get();
-        if(!sig || !sig->resolve || sig->resolve(sig->user,StringView("HTGame.exe"),StringView(".text"),
-            StringView(fishing::profile::CatchContinue),&catch_continue).code!=0) return false;
-    }
+    catch_continue=fishing::profile::compatibility.Address("CatchContinue");
+    if(!catch_continue) return false;
     const auto ready=Fn(r,"HTGame","HTUI_FishingSuccess","EnableCloseButton",0,0);
     if(!ready || !Invoke(r,widget,ready,nullptr) || !InvokeCatchContinue(catch_continue,widget)) return false;
     continued_result=result_serial;return true;
@@ -328,14 +321,11 @@ bool Cast(const Reader& r,uintptr_t widget,uintptr_t world,uintptr_t util) {
     std::array<double,3> position{};
     if(!has_cast || !character_fn || !position_fn || !Invoke(r,util,character_fn,character.data()) ||
        !r.IsA(character[1],"Actor") || !Invoke(r,character[1],position_fn,&position) || !calibration.Valid(current_level,position)) {
-        has_cast=false;Publish("请在此钓鱼点手动按 F 抛竿一次，记录抛竿位置。");return false;
+        has_cast=false;Publish(localizer.Text("status.cast_point_missing","Press F once at this fishing spot to record the cast point."));return false;
     }
     if(!ActiveWidget(r,widget) || !r.IsA(widget,"HTUI_FishMain")) return false;
-    if(!cast_begin) {
-        const auto sig=Host(api).Query<AnomalySignatureServiceV1>(ANOMALY_SIGNATURE_SERVICE_V1_ID).get();
-        if(!sig || !sig->resolve || sig->resolve(sig->user,StringView("HTGame.exe"),StringView(".text"),
-            StringView(fishing::profile::CastBegin),&cast_begin).code!=0) return false;
-    }
+    cast_begin=fishing::profile::compatibility.Address("CastBegin");
+    if(!cast_begin) return false;
     // The F-button's complete cast path validates gear and aiming, resets line endurance,
     // sets local fishing state, then sends the request. A bare RPC skips those steps.
     const auto before=cast_requests;
@@ -346,12 +336,21 @@ bool Cast(const Reader& r,uintptr_t widget,uintptr_t world,uintptr_t util) {
 bool EnsureWindow() {
     if(window.id) return true;
     if(!windows || !windows->register_window || !windows->begin || !windows->end || !windows->state) return false;
-    AnomalyWindowSpecV1 spec{};spec.struct_size=sizeof(spec);spec.id=StringView("autofish-main");spec.title=StringView("autofish");
+    AnomalyWindowSpecV1 spec{};spec.struct_size=sizeof(spec);spec.id=StringView("autofish-main");
+    const auto title=localizer.Text("window.title","Auto Fish");
+    spec.title=StringView(title);
     spec.initial_width=420;spec.initial_height=530;spec.minimum_width=280;spec.minimum_height=180;
     spec.maximum_width=650;spec.maximum_height=600;spec.default_open=1;
     return windows->register_window(windows->user,&spec,&window).code==0 && window.id;
 }
 AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host,void** context) noexcept {
+    if (!fishing::profile::LoadCompatibility(host)) return {ANOMALY_STATUS_V1_UNAVAILABLE,0,{}};
+    const auto& layout=fishing::profile::native_layout;
+    if (layout.MapSize!=sizeof(HudMapHeader) || layout.MapInlineBits!=offsetof(HudMapHeader,inline_bits) ||
+        layout.MapBitsData!=offsetof(HudMapHeader,extra_bits) || layout.MapBitCount!=offsetof(HudMapHeader,bit_count) ||
+        layout.MapFreeIndex!=offsetof(HudMapHeader,first_free) || layout.RowStride!=sizeof(TableEntry) ||
+        layout.MapEntryStride!=sizeof(TableEntry) || layout.MapValue!=offsetof(TableEntry,row))
+        return {ANOMALY_STATUS_V1_UNAVAILABLE,0,{}};
     api=host;core=Host(host).Query<AnomalyCoreServiceV1>(ANOMALY_CORE_SERVICE_V1_ID).get();
     names=Host(host).Query<AnomalyUe5NamesServiceV1>(ANOMALY_UE5_NAMES_SERVICE_V1_ID,2).get();
     objects=Host(host).Query<AnomalyUe5ObjectsServiceV1>(ANOMALY_UE5_OBJECTS_SERVICE_V1_ID).get();
@@ -360,6 +359,7 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host,void** context) n
     plugin_state=Host(host).Query<AnomalyPluginStateServiceV1>(ANOMALY_PLUGIN_STATE_SERVICE_V1_ID).get();
     events=Host(host).Query<AnomalyUe5ProcessEventServiceV1>(ANOMALY_UE5_PROCESS_EVENT_SERVICE_V1_ID).get();
     windows=Host(host).Query<AnomalyWindowServiceV1>(ANOMALY_WINDOW_SERVICE_V1_ID).get();
+    localizer=anomaly::sdk::Localizer(host);
     if(context) *context=nullptr;return Ok();
 }
 AnomalyStatusV1 ANOMALY_CALL Start(void*) noexcept {
@@ -374,7 +374,7 @@ AnomalyStatusV1 ANOMALY_CALL Start(void*) noexcept {
     restock={};pending_bait={};equip_pending=false;equip_sent=0;text_to_string=0;
     if(events && events->subscribe) events->subscribe(events->user,Observe,nullptr,&event_subscription);
     registry=world_slot=0;retry_init=next_tick=next_ui={};functions.clear();missing_functions.clear();offsets.clear();
-    window=epoch=main_widget=result_widget=player_handle={};Publish("请打开钓鱼界面，再开启自动钓鱼。");EnsureWindow();return Ok();
+    window=epoch=main_widget=result_widget=player_handle={};Publish(localizer.Text("status.open_fishing_ui","Open the fishing UI, then enable auto fishing."));EnsureWindow();return Ok();
 }
 AnomalyStatusV1 ANOMALY_CALL Stop(void*,uint32_t) noexcept {
     enabled=false;shown=false;
@@ -396,14 +396,14 @@ void ANOMALY_CALL Update(void*,double) noexcept {
         if(Clock::now()<next_tick) return;
         next_tick=Clock::now()+std::chrono::milliseconds(enabled.load() && event_phase==5?20:100);
         if(!core || !names || !objects || !framework || !world_service || !framework->is_game_thread(framework->user)) return;
-        const Reader r{names};if(!Initialize(r,objects)) {Publish("正在等待游戏接口。");return;}
+        const Reader r{names};if(!Initialize(r,objects)) {Publish(localizer.Text("status.waiting_interfaces","Waiting for the game interfaces."));return;}
         SyncBaitSettings();SyncSellSettings();UpdateBaitCatalog(r);
         AnomalyGenerationHandleV1 current{};
         if(world_service->current(world_service->user,&current).code!=0 || !current.id) return;
         if(epoch.id && (current.id!=epoch.id || current.generation!=epoch.generation)) {
                     enabled=false;flow.Reset();main_widget=result_widget=player_handle={};functions.clear();missing_functions.clear();offsets.clear();next_ui={};
             event_phase=-1;result_pending=false;has_cast=false;
-            Publish("场景已切换，自动钓鱼已停止。");
+            Publish(localizer.Text("status.level_changed","The level changed, so auto fishing stopped."));
         }
         epoch=current;
         const auto world=World(r),util=Find(r,"/Script/HTGame.Default__HTUtil");
@@ -413,15 +413,15 @@ void ANOMALY_CALL Update(void*,double) noexcept {
         }
         const auto get=Fn(r,"HTGame","HTUtil","GetMainPlayerState",2,16);
         std::array<uintptr_t,2> p{world,0};
-        if(!world || !util || !get || !Invoke(r,util,get,p.data()) || !r.IsA(p[1],"HTPlayerState")) {Publish("正在等待玩家。");return;}
+        if(!world || !util || !get || !Invoke(r,util,get,p.data()) || !r.IsA(p[1],"HTPlayerState")) {Publish(localizer.Text("status.waiting_player","Waiting for the player."));return;}
         const auto ps=p[1];const auto handle=Handle(r,ps);
         if(!handle.id) return;
-        if(player_handle.id && player_handle.id!=handle.id) {enabled=false;flow.Reset();Publish("玩家已变化，自动钓鱼已停止。");}
+        if(player_handle.id && player_handle.id!=handle.id) {enabled=false;flow.Reset();Publish(localizer.Text("status.player_changed","The player changed, so auto fishing stopped."));}
         player_handle=handle;
         RefreshBaitStock(r,ps);
         observed_ps=ps;
         const auto phase_offset=Field(r,ps,"CurrFishingState",1);uint8_t phase{};
-        if(phase_offset<0 || !r.Read(ps+phase_offset,phase)) {enabled=false;Publish("当前钓鱼接口暂不可用。");return;}
+        if(phase_offset<0 || !r.Read(ps+phase_offset,phase)) {enabled=false;Publish(localizer.Text("status.phase_unavailable","The fishing interface is unavailable right now."));return;}
         auto main=Resolve(r,objects,main_widget),result=Resolve(r,objects,result_widget);
         bool main_open=ActiveWidget(r,main),result_open=ActiveWidget(r,result);
         if((!main_open && !result_open) || result_pending) {ReadHudWidgets(r,world,util);main=Resolve(r,objects,main_widget);result=Resolve(r,objects,result_widget);main_open=ActiveWidget(r,main);result_open=ActiveWidget(r,result);}
@@ -437,10 +437,17 @@ void ANOMALY_CALL Update(void*,double) noexcept {
         const bool selling=ServiceAutoSell(r,ps,phase<=1 && (!result_pending || result_open),now);
         if(on && paused) return;
         if(phase!=5) last_rod_update={};
-        static constexpr std::array<const char*,6> labels{"请打开钓鱼界面。","准备抛竿。","正在抛竿。","等待鱼咬钩。","鱼已咬钩，准备提竿。","正在自动遛鱼。"};
-        Publish(completed?"钓鱼结算中。":phase<labels.size()?labels[phase]:"未知钓鱼状态，已暂停。");
+        static constexpr std::array<std::string_view,6> phase_keys{
+            "status.phase_open_ui","status.phase_ready","status.phase_casting",
+            "status.phase_waiting_bite","status.phase_hooked","status.phase_reeling"};
+        static constexpr std::array<std::string_view,6> phase_english{
+            "Open the fishing UI.","Ready to cast.","Casting.",
+            "Waiting for a bite.","A fish is biting; ready to hook.","Reeling automatically."};
+        Publish(completed?localizer.Text("status.result","Resolving the catch."):
+            phase<phase_keys.size()?localizer.Text(phase_keys[phase],phase_english[phase]):
+            localizer.Text("status.phase_unknown","Unknown fishing state; auto fishing paused."));
         if(!on) return;
-        if(selling) {Publish("正在等待卖鱼完成。");return;}
+        if(selling) {Publish(localizer.Text("status.waiting_sell","Waiting for the sale to finish."));return;}
         const auto action=flow.Next(phase,main_open,completed,repeat.load(),now,result_open && continued_result!=result_serial);bool sent=false;
         if((action==fishing::Action::Cast || action==fishing::Action::Continue) && !EnsureBait(r,ps,util,now)) return;
         if(action==fishing::Action::Cast) {
@@ -450,30 +457,40 @@ void ANOMALY_CALL Update(void*,double) noexcept {
             const auto fn=Fn(r,"HTGame","HTPlayerState","ServerPlayerSureFishing",0,0);sent=fn && Invoke(r,ps,fn,nullptr);
         }
         else if(action==fishing::Action::Pull) {
-            if(!Pull(r,main)) {enabled=false;Publish("遛鱼控制条暂不可用，自动操作已停止。");}
+            if(!Pull(r,main)) {enabled=false;Publish(localizer.Text("status.pull_unavailable","The reel control bar is unavailable, so automation stopped."));}
             return;
         } else if(action==fishing::Action::Continue) sent=ContinueFishing(r,result);
-        else if(action==fishing::Action::Stop) {paused=true;Publish(completed&&!repeat.load()?"单次钓鱼已完成。":"未收到钓鱼响应，自动操作已暂停。关闭再开启可重试。");}
+        else if(action==fishing::Action::Stop) {paused=true;Publish(completed&&!repeat.load()?
+            localizer.Text("status.single_done","The single cast is complete."):
+            localizer.Text("status.no_response","No fishing response, so automation paused. Toggle it off and on to retry."));}
         if(action!=fishing::Action::None && action!=fishing::Action::Stop) {
             // Waiting for the intro or a result widget is not a sent continuation.
             if(action!=fishing::Action::Continue || sent) flow.Sent(now);
             if(sent) Log("autofish action="+std::to_string(static_cast<int>(action))+" phase="+std::to_string(phase));
-            else Publish(action==fishing::Action::Cast?"请把抛竿点对准水面，正在等待按钮可用。":"钓鱼按钮暂不可用，正在等待。");
+            else Publish(action==fishing::Action::Cast?
+                localizer.Text("status.aim_waiting","Aim the cast point at the water; waiting for the button."):
+                localizer.Text("status.button_waiting","The fishing button is unavailable; waiting."));
         }
-    } catch(...) {enabled=false;Publish("钓鱼界面刷新中，自动操作已停止。");}
+    } catch(...) {enabled=false;Publish(localizer.Text("status.refresh_stopped","The fishing UI is refreshing, so automation stopped."));}
 }
 void Content(const AnomalyUiServiceV1* ui) {
     int on=enabled.load(),loop=repeat.load();
-    if(ui->checkbox(ui->user,StringView("启用自动钓鱼"),&on)) enabled=on!=0;
-    if(ui->checkbox(ui->user,StringView("连续钓鱼"),&loop)) repeat=loop!=0;
+    const auto enabled_label=localizer.Text("option.enabled","Enable auto fishing");
+    if(ui->checkbox(ui->user,StringView(enabled_label),&on)) enabled=on!=0;
+    const auto repeat_label=localizer.Text("option.repeat","Continuous fishing");
+    if(ui->checkbox(ui->user,StringView(repeat_label),&loop)) repeat=loop!=0;
     if(ui->separator) ui->separator(ui->user);
     BaitContent(ui);
     if(ui->separator) ui->separator(ui->user);
     SellContent(ui);
     if(ui->separator) ui->separator(ui->user);
-    ui->text(ui->user,StringView("更换钓鱼点后，先手动抛竿一次。"));
+    const auto hint=localizer.Text("hint.manual_cast_once","After changing the fishing spot, cast once by hand first.");
+    ui->text(ui->user,StringView(hint));
     if(const auto s=status.load()) ui->text(ui->user,StringView(*s));
-    ui->text(ui->user,StringView(std::string("本次收鱼：")+std::to_string(caught.load())));
+    const auto caught_count=std::to_string(caught.load());
+    const std::array caught_arguments{std::string_view(caught_count)};
+    const auto caught_text=localizer.Format("text.caught","Caught this run: {0}",caught_arguments);
+    ui->text(ui->user,StringView(caught_text));
 }
 void ANOMALY_CALL Draw(void*,const AnomalyUiServiceV1* ui) noexcept {
     try {
@@ -483,12 +500,13 @@ void ANOMALY_CALL Draw(void*,const AnomalyUiServiceV1* ui) noexcept {
             int32_t open{};if(windows->begin(windows->user,window,0,&open).code!=0) return;
             if(open) {shown=true;Content(ui);}windows->end(windows->user,window);return;
         }
-        UiWindow panel(ui,"autofish",&fallback_open);if(panel) {shown=true;Content(ui);}
+        const auto title=localizer.Text("window.title","Auto Fish");
+        UiWindow panel(ui,title,&fallback_open);if(panel) {shown=true;Content(ui);}
     } catch(...) {}
 }
 }
 ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(AnomalyPluginDescriptorV1* descriptor) {
     if(!descriptor || descriptor->struct_size<sizeof(*descriptor)) return {ANOMALY_STATUS_V1_INVALID_ARGUMENT,0,{}};
     *descriptor={sizeof(*descriptor),ANOMALY_PLUGIN_API_V1_MAJOR,ANOMALY_PLUGIN_API_V1_MINOR,
-        StringView("b1ank.autofish"),StringView("autofish"),StringView("b1ank"),StringView("0.1.15"),Load,Start,Stop,Unload,Update,Draw};return Ok();
+        StringView("b1ank.autofish"),StringView("Auto Fish"),StringView("b1ank"),StringView("0.1.16"),Load,Start,Stop,Unload,Update,Draw};return Ok();
 }
